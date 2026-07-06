@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第二课 — executeToolCall:工具执行前的层层关卡</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第二课</p>
+<h1><code>executeToolCall</code>:工具是「哑的」,循环才是守门人</h1>
+
+<p>
+第一课里,内层循环有一行不起眼的调用:
+<code>toolResult := executeToolCall(...)</code>
+(<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:482</a>)。
+那一行背后是整个 agent 里<strong>唯一</strong>会产生真实副作用的地方 —— 写文件、跑
+shell、发网络请求。所以它也是安全模型的全部重量所在。这一课我们拆开它。
+</p>
+
+<blockquote>
+对齐 mission:你的目标之一是「说清一个危险工具调用的权限/沙箱判定路径」。这一课
+就交付它 —— 把 <code>executeToolCall</code> 看成一串必须逐层通过的关卡。
+</blockquote>
+
+<h2>核心洞察:工具不自己把关</h2>
+<p>
+先看工具长什么样。<code>Tool</code> 接口只有五个方法:
+<a class="cite" href="../../zero/internal/tools/types.go">types.go:119</a>
+</p>
+<pre><code>type Tool interface {
+    Name() string
+    Description() string
+    Parameters() Schema
+    Safety() Safety              // ← 只「声明」危险等级,不「执行」任何检查
+    Run(ctx, args) Result        // ← 直接干活,默认自己不做权限判断
+}</code></pre>
+<p>
+注意:<code>Run</code> 里没有权限逻辑。工具只通过 <code>Safety()</code> <em>声明</em>
+自己有多危险 —— 一个三值枚举:
+<a class="cite" href="../../zero/internal/tools/types.go">types.go:32</a>
+</p>
+<ul>
+<li><code>PermissionAllow</code> —— 安全,直接放行(如读文件、grep)</li>
+<li><code>PermissionPrompt</code> —— 需要问用户(如写文件、跑 shell)</li>
+<li><code>PermissionDeny</code> —— 默认拒绝</li>
+</ul>
+<p>
+真正的<em>执行</em>判断全部由 <code>executeToolCall</code> 在调用 <code>Run</code>
+<strong>之前</strong>完成。这是刻意的架构决策:把策略(policy)从机制(mechanism)里
+剥出来。工具作者只需诚实声明危险等级,写工具时完全不必操心权限、沙箱、密钥擦除 ——
+这些横切关注点在循环里集中处理一次。
+</p>
+
+<div class="callout">
+<span class="label">一句话记住</span>
+<code>Run</code> 是纯机制,<code>executeToolCall</code> 是策略。所有关卡都架在
+<em>一次</em>纯粹的工具执行外面 —— 这就是「纵深防御」的形状。
+</div>
+
+<h2>七道关卡(按顺序)</h2>
+<p>
+一个工具调用要抵达真正的 <code>Run</code>,得依次穿过这些门。任何一道都可能提前返回一个
+<code>ToolResult</code>,让工具<strong>根本不执行</strong>:
+</p>
+
+<h3>① 参数解码</h3>
+<p>
+把模型给的 JSON 参数解成 <code>map[string]any</code>;解析失败直接返回错误结果,让模型
+重试。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:776</a>
+</p>
+
+<h3>② 工具过滤器(启用/禁用名单)</h3>
+<p>
+如果本次运行有 <code>EnabledTools</code> 允许名单或 <code>DisabledTools</code> 拒绝名单,
+不在名单内的工具在这里就被挡下(<code>tool_search</code> 作为发现网关被特别豁免)。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:791</a>
+</p>
+
+<h3>③ 工具自己的「预权限」否决 + 特殊拦截</h3>
+<p>
+实现了 <code>PrePermissionRejecter</code> 的工具可以在权限流之前先否决非法参数。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:811</a>
+紧接着,<code>ask_user</code> 和 <code>request_permissions</code> 被<em>拦截</em>出来 ——
+它们需要路由到交互前端,而不是阻塞在工具内部。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:822</a>
+</p>
+
+<h3>④ 确定「是否已授权」的基线</h3>
+<p>
+三种情况下这道调用天然被授权:处于 <code>unsafe</code> 权限模式;工具对这组参数的
+<em>有效权限</em>是 <code>Allow</code>;或者命中了之前保存的命令前缀授权。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:829</a>
+</p>
+<p>
+这里有个精妙点:权限可以<em>随参数变化</em>。工具可选实现 <code>ArgsPermissioner</code>,
+于是 <code>effectivePermission</code> 会按具体参数决定 —— 比如
+<code>rm -rf /</code> 需要问,而 <code>ls</code> 不用,尽管都是同一个 shell 工具。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1665</a>
+</p>
+
+<h3>⑤ 沙箱预评估</h3>
+<p>
+若配置了沙箱引擎,<code>Sandbox.Evaluate</code> 先给出一个 <code>Decision</code>
+(放行 / 提示 / 拒绝),连同原因(如「网络被阻断」)。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:859</a>
+</p>
+
+<h3>⑥ 向用户请求权限(如果需要)</h3>
+<p>
+<code>shouldRequestPermission</code> 综合工具的静态权限 + 沙箱决定,判断要不要弹窗。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1672</a>
+如果要,就通过 <code>OnPermissionRequest</code> 回调问前端,然后用一个大 <code>switch</code>
+处理用户的回答:允许一次 / 本会话允许 / 允许该命令前缀 / 永久允许 / 取消 / 拒绝 ——
+每个分支还负责按对应的作用域(turn / session / 持久)去授予网络、文件系统等附加权限,
+并登记 cleanup 以便运行结束时回收。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:865</a>
+</p>
+
+<h3>⑦ beforeTool 钩子</h3>
+<p>
+用户配置的 <code>beforeTool</code> 钩子可以在最后一刻否决调用(非零退出即阻断)。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1002</a>
+</p>
+
+<h2>穿过所有关卡之后</h2>
+<p>
+只有全部通过,才真正执行:
+<code>registry.RunWithOptions(...)</code>,把 <code>permissionGranted</code>、沙箱、
+文件版本追踪器等一并传入。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1021</a>
+</p>
+<p>执行完还有三个收尾动作,同样在循环里而非工具里:</p>
+<ul>
+<li><strong>沙箱受限重试</strong>:若因沙箱阻断失败(如缺网络),在拿到授权后可无沙箱/带网重试一次。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1043</a></li>
+<li><strong>afterTool 钩子</strong>:执行后的钩子(如格式化、go vet)结果会拼接回给模型。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1070</a></li>
+<li><strong>密钥擦除</strong>:在 registry 边界统一擦除,所以返回时 <code>Output</code> 已脱敏。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1079</a></li>
+</ul>
+<p>
+最后打包成一个 <code>ToolResult</code> 返回给第一课的内层循环,append 进 messages。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1082</a>
+</p>
+
+<div class="callout warn">
+<span class="label">为什么这么设计</span>
+把每一道关卡都放在工具<em>外面</em>,意味着:新增一个工具无法「忘记」做权限检查 ——
+它<em>没有能力</em>绕过。安全性不依赖每个工具作者的自觉,而是循环强制施加的。这正是
+把策略与机制分离的收益。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">Zero 的 <code>Tool</code> 接口对权限检查负什么责任?</p>
+  <button class="opt">每个工具在 Run 里自己弹窗询问用户</button>
+  <button class="opt">工具继承一个带权限逻辑的基类</button>
+  <button class="opt">工具只用 Safety() 声明危险等级,不做执行检查</button>
+  <button class="opt">工具把权限判断委托给沙箱引擎</button>
+  <div class="fb"
+    data-correct="对 —— 工具只声明 Safety(types.go:119),所有把关都在 executeToolCall 里、Run 之外。"
+    data-wrong="工具只通过 Safety() 声明危险等级(types.go:119);把关全在循环里,Run 之外。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么同一个 shell 工具,<code>ls</code> 直接放行而 <code>rm -rf</code> 要问用户?</p>
+  <button class="opt">沙箱按命令名维护一张黑名单</button>
+  <button class="opt">工具实现了 ArgsPermissioner,按参数返回不同权限</button>
+  <button class="opt">模型在调用时附带了危险标记</button>
+  <button class="opt">两者其实是两个不同的工具</button>
+  <div class="fb"
+    data-correct="对 —— effectivePermission 会调用 ArgsPermissioner.PermissionForArgs,权限随参数变化(loop.go:1665)。"
+    data-wrong="是 ArgsPermissioner:effectivePermission 按具体参数决定权限(loop.go:1665)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">把权限、沙箱、密钥擦除放在工具「外面」的循环里,主要收益是?</p>
+  <button class="opt">新工具无法绕过安全检查——它没有能力绕过</button>
+  <button class="opt">工具执行速度更快</button>
+  <button class="opt">模型能看到更多工具</button>
+  <button class="opt">减少了 messages 切片的内存占用</button>
+  <div class="fb"
+    data-correct="对 —— 策略与机制分离:安全性由循环强制,不依赖每个工具作者的自觉。"
+    data-wrong="是策略/机制分离:关卡在工具外,新工具没有能力绕过检查。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +774 ../zero/internal/agent/loop.go   # executeToolCall 全貌
+less +119 ../zero/internal/tools/types.go  # Tool 接口 + Safety</code></pre>
+<p>
+读 <code>executeToolCall</code> 时,别陷进那个巨大的权限 <code>switch</code>(⑥)细节 ——
+先把七道关卡的<em>顺序</em>认出来,看清「哪些分支会提前 <code>return</code> 让 <code>Run</code>
+不被执行」。顺序本身就是安全模型。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「⑥ 里那个权限 <code>switch</code> 的每个分支分别对应 TUI 上哪个选项?」、
+「沙箱 <code>Decision</code> 是怎么算出来的?」(那会引出沙箱那一课),或者
+「命令前缀授权是怎么持久化和匹配的?」
+</div>
+
+<div class="nav">
+  <span>← 第一课:Agent 主循环</span>
+  <span>下一课:第三课 —— 上下文压缩:如何守住模型窗口 →</span>
+</div>
+
+<footer>Zero 架构课程 · 第二课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

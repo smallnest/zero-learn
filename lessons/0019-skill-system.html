@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十九课 — Skill 系统:磁盘上的一叠 SKILL.md,由模型「按需取用」而非预先灌入</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十九课</p>
+<h1>Skill:一个只读工具把「按需指令包」拉进上下文,而不是塞满 prompt</h1>
+
+<p>
+第十八课把外部<em>能力</em>(MCP 工具)接了进来。这一课接的是外部<em>指令</em>:一叠写在磁盘上的
+<code>SKILL.md</code> —— 项目约定、确认策略、评审清单之类可复用的说明。核心问题是:
+这些指令<strong>怎么进到模型眼前</strong>?Zero 的答案很克制:不预先灌进 system prompt,而是做成一个<em>只读工具</em>
+<code>skill</code> <a class="cite" href="../../zero/internal/tools/skill.go">skill.go:15</a>,由模型<strong>按需</strong>加载。
+</p>
+
+<blockquote>
+对齐 mission:一个 coding agent 想让用户「教」它一些可复用的规矩,最偷懒的做法是把所有规矩一股脑塞进 prompt ——
+但那会把第五课的 prompt 预算烧光,而且大部分规矩这一轮根本用不上。Zero 反过来:规矩躺在磁盘上,模型<em>觉得相关时</em>才用
+<code>skill</code> 工具把某一条拉进来。看懂这个「按需取用」的取舍,就看懂了 agent 怎么在「可扩展」和「prompt 不膨胀」之间走钢丝。
+</blockquote>
+
+<h2>一个 Skill 就是一个目录 + 一份 SKILL.md</h2>
+<p>
+数据模型小到极致 <a class="cite" href="../../zero/internal/skills/skills.go">skills.go:22</a>:一个 skill = 一个目录,里面一份
+<code>SKILL.md</code>;可选的 <code>---</code> frontmatter 提供 <code>name</code>/<code>description</code>,markdown 正文就是要喂给模型的内容。
+</p>
+<pre><code>~/.local/share/zero/skills/
+  code-review/
+    SKILL.md          # ---\nname: code-review\ndescription: ...\n---\n<正文>
+  commit-style/
+    SKILL.md                                    // skills.go:29</code></pre>
+<div class="callout">
+<span class="label">刻意「零依赖 + 坏的跳过」</span>
+frontmatter 是<em>手写行解析</em>,不引 YAML 库(<code>splitFrontmatter</code>
+<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:261</a> / <code>frontmatterValue</code> <a class="cite" href="../../zero/internal/skills/skills.go">:282</a>);
+而且单个 <code>SKILL.md</code> 解析失败就<strong>跳过它</strong>,而不是让整次加载失败——<em>一个坏 skill 绝不能连累其余好的</em>
+(<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:170</a>)。这是「best-effort、优雅降级」在扩展点上的又一次体现(呼应第十八课 MCP 的 skip-bad-server)。
+</div>
+
+<h2>发现:一个目录,三级回退,缺了也不报错</h2>
+<p>
+<code>DefaultDir</code> <a class="cite" href="../../zero/internal/skills/skills.go">skills.go:35</a> 按优先级定位:
+<code>ZERO_SKILLS_DIR</code> 覆盖 → <code>$XDG_DATA_HOME/zero/skills</code> → <code>~/.local/share/zero/skills</code>。
+目录<strong>不存在就等于「没有 skill」</strong>,返回空列表而非错误(<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:133</a>)。
+这一版是<em>用户级</em>的,没有项目级 skill 目录——想和团队共享的规矩得走 <code>AGENTS.md</code> 或 hook。
+</p>
+
+<h2>关键决定:skill 是个<em>工具</em>,不是一段预注入的 prompt</h2>
+<p>
+最重要的架构选择在这里。<code>skillTool.Run</code> <a class="cite" href="../../zero/internal/tools/skill.go">skill.go:58</a>
+被模型调用时,才 <code>skills.Load</code> 读目录、按名字返回那一条 skill 的正文当作工具 <code>Output</code>。它是<strong>只读</strong>的
+(<code>readOnlySafety</code> <a class="cite" href="../../zero/internal/tools/skill.go">skill.go:51</a>)——于是它就是第十七课注册表里一个再普通不过的 <code>Tool</code>,进的是只读工具集。
+</p>
+<div class="callout">
+<span class="label">为什么是「按需拉取」而不是「开局全灌」</span>
+如果启动时把所有 skill 正文塞进 system prompt,第五课的预算立刻被无关规矩吃掉。做成工具后,模型<em>判断这一轮相关</em>才拉一条进来——
+prompt 保持精简,能力却不设上限。这与第十八课 MCP 工具的<em>延迟广告</em>是同一个母题:<strong>可扩展性不能以 prompt 膨胀为代价</strong>。
+更妙的是自纠错设计:传了未知名字,工具不静默失败,而是<em>返回可用 skill 列表</em>(<a class="cite" href="../../zero/internal/tools/skill.go">skill.go:79</a>),让模型看到清单后自己改对。
+</div>
+
+<h2>安全:一个 permission-allow 的只读工具,必须把自己关进根目录里</h2>
+<p>
+这里藏着一处很讲究的安全考量。<code>skill</code> 是 <em>permission-allow</em>(默认放行)的只读工具,读的又是<strong>用户可控的目录</strong>——
+那它绝不能因为目录里放了个符号链接,就变成一个「任意文件读取器」。<code>confineSkillPath</code>
+<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:101</a> 就是这道闸:
+</p>
+<ul>
+<li>先 <code>EvalSymlinks</code> 把 skills 根和每个 <code>SKILL.md</code> 都解析成真实路径,再校验它<em>没跳出根</em>(<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:110</a>)——一个指向 <code>/etc/passwd</code> 的软链接 SKILL.md 会被拒。</li>
+<li>只读<strong>常规文件</strong>(<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:116</a>):若根里有个名叫 <code>SKILL.md</code> 的 FIFO/设备/目录,<code>os.ReadFile</code> 可能<em>永久阻塞</em>——所以非常规文件一律跳过。</li>
+</ul>
+<div class="callout warn">
+<span class="label">架构启示:自动放行的工具,爆炸半径要靠自己收</span>
+一个需要用户点确认的工具,危险还有用户兜底;而 <code>skill</code> 默认放行、又读用户目录,那「不越界」就得由<em>加载器自己</em>保证。
+「permission-allow」这个便利,是用「把读取范围死锁在根目录内」换来的。这正是第十三/十七课「机制决定能不能跑」在一个具体工具上的落地:能自动跑,前提是它证明得了自己的爆炸半径有限。
+</div>
+
+<h2>确定性:重名 skill 谁赢,写死了规则</h2>
+<p>
+两个目录声明了相同的 frontmatter <code>name</code> 怎么办?<code>load</code>
+<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:179</a> 给了个<em>确定性</em>规则:<code>os.ReadDir</code> 按目录名排序,
+所以<strong>字典序最靠前的目录胜出</strong>,后来的同名者被丢弃,并记进 <code>DuplicateName</code>
+<a class="cite" href="../../zero/internal/skills/skills.go">skills.go:62</a> 供上层警告用户。不搞「后来覆盖」这种依赖扫描顺序的隐式行为——同样的磁盘状态永远解析出同样的赢家。
+</p>
+
+<h2>它怎么熬过压缩:loaded skill 作为「保留状态」落在摘要里</h2>
+<p>
+模型拉进来的 skill 正文,如果随着对话变长被第三课的压缩<em>卷走</em>,规矩就丢了。所以压缩时,已加载的 skill 被当作<strong>结构化保留状态</strong>
+以 JSON 形式接到摘要后面(<code>loadedSkills</code> <a class="cite" href="../../zero/internal/agent/compaction_preserve.go">compaction_preserve.go:112</a>),
+——但每条正文<em>截到 2 KiB</em>(<code>maxPreservedSkillBytes</code> <a class="cite" href="../../zero/internal/agent/compaction_preserve.go">compaction_preserve.go:45</a>):
+让一个巨型 skill 不至于反过来<em>撑爆它自己所参与的那次压缩</em>;名字和开头留着,模型需要全文可以再 <code>skill</code> 一次拉回来。这是第三课「压缩保结构」在 skill 上的具体化。
+</p>
+
+<h2>合起来看:一叠磁盘文件,一个只读工具,三道纪律</h2>
+<p>
+Skill 系统几乎没有「系统」——它就是<em>一个目录的约定</em> + <em>一个只读工具</em>。真正的功夫全在三条纪律上:
+<strong>按需取用</strong>(不烧 prompt 预算)、<strong>根目录封闭</strong>(自动放行的工具收住爆炸半径)、<strong>确定性去重 + 坏的跳过</strong>(可预测、优雅降级)。
+一个可复用指令包,就这样以最小的机制被安全地接进了 agent。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">一个 skill 的正文是<em>怎么</em>进到模型眼前的?</p>
+  <button class="opt">启动时把每个 skill 的正文一次性全部注入进系统提示词中</button>
+  <button class="opt">靠一个只读的 skill 工具由模型按需加载,不预塞进提示词</button>
+  <button class="opt">由用户在启动参数里逐条列出本次要启用的那几个 skill 名</button>
+  <button class="opt">每轮对话前自动扫描目录挑最相关的 skill 载入到上下文里</button>
+  <div class="fb"
+    data-correct="对 —— skill 是只读工具,模型判断相关时才 Run 加载那条正文当 Output;prompt 保持精简、能力不设上限。传未知名字还会返回可用清单供自纠(skill.go:58/:79)。"
+    data-wrong="做成只读工具、模型按需拉取,不预注入——否则第五课 prompt 预算被无关规矩吃光。同第十八课 MCP 延迟广告的母题(skill.go:15)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">skill 加载器为什么要解析符号链接、把每个 SKILL.md 锁在根目录内?</p>
+  <button class="opt">因为符号链接会让同一个 skill 被重复加载两遍白白浪费预算</button>
+  <button class="opt">因为跨目录的符号链接会破坏重名去重时字典序的确定性保证</button>
+  <button class="opt">它是默认放行的只读工具,须防符号链接使其变任意文件读取器</button>
+  <button class="opt">因为解析成真实路径后才能向模型准确展示该文件的来源位置</button>
+  <div class="fb"
+    data-correct="对 —— skill 是 permission-allow 只读工具、读用户可控目录,故 confineSkillPath 解析符号链接并校验没跳出根,还只读常规文件(防 FIFO 让 ReadFile 永久阻塞)(skills.go:101)。"
+    data-wrong="自动放行的工具爆炸半径要自己收:EvalSymlinks + 根内校验挡住软链接逃逸,只读常规文件挡住 FIFO 阻塞(skills.go:110/:116)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">两个 skill 声明了<em>相同的名字</em>时,加载器怎么处理?</p>
+  <button class="opt">字典序最靠前的目录胜出,重名者被丢弃并记录下来以保确定性</button>
+  <button class="opt">后被扫描到的那个目录里的版本胜出并静默覆盖掉先前的同名者</button>
+  <button class="opt">两个同名的 skill 会被自动合并成一份正文按扫描顺序拼在一起</button>
+  <button class="opt">整个加载过程会立即中止并报错要求用户先手动重命名其一后再来</button>
+  <div class="fb"
+    data-correct="对 —— os.ReadDir 按目录名排序,故字典序最靠前的目录胜出,后来同名者丢弃并记进 DuplicateName 供警告;同样磁盘状态永远解析出同样赢家(skills.go:179/:62)。"
+    data-wrong="确定性规则:字典序最前的目录赢,重名丢弃+记录,不搞依赖扫描顺序的『后来覆盖』(skills.go:179)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +15  ../zero/internal/tools/skill.go            # skillTool:只读工具,Run 时按名加载
+less +22  ../zero/internal/skills/skills.go          # Skill 结构 + DefaultDir 三级回退
+less +101 ../zero/internal/skills/skills.go          # confineSkillPath:符号链接封闭 + 只读常规文件
+less +126 ../zero/internal/skills/skills.go          # load:坏的跳过 + 字典序确定性去重
+less +112 ../zero/internal/agent/compaction_preserve.go  # loadedSkills:压缩时作为保留状态存活(截 2KiB)</code></pre>
+<p>
+读的顺序:先看 <code>skill.go</code> 的 <code>Run</code>——体会「skill 不过是个只读工具,按需返回正文」。再读 <code>skills.go</code> 的
+<code>confineSkillPath</code>,想清楚「一个默认放行的工具为什么必须自己锁死读取范围」。最后看 <code>compaction_preserve.go</code> 的
+<code>loadedSkills</code>,理解拉进来的规矩怎么熬过压缩、又为何要截断。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「skill(模型按需拉)和<em>用户 slash 命令</em>(<code>usercommands</code>,用户敲 <code>/name</code> 展开模板当 prompt 提交)在机制上到底差在哪、各自何时用?」、
+「plugin 声明的 skill 为什么<em>还没</em>被合进 <code>skill</code> 工具的发现(<a class="cite" href="../../zero/internal/plugins/activate.go">activate.go:225</a> 收集了 SkillRoots 却未接入 loader)?」,
+或者换个大块:「swarm/多 agent 编排的骨架——多个 agent 怎么被拉起、分工、汇合?」</div>
+
+<div class="nav">
+  <span>← 第十八课:MCP 接入</span>
+  <span>可复用指令包的「按需取用 + 根目录封闭」已覆盖。下一步可选:skill vs 用户命令 / plugin 的 skill 合并 / swarm 编排骨架</span>
+</div>
+
+<footer>Zero 架构课程 · 第十九课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

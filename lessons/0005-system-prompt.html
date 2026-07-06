@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第五课 — 系统提示是怎么拼出来的</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第五课</p>
+<h1>系统提示:一次拼装、可缓存的分段组合</h1>
+
+<p>
+第一课的循环第一行就播种了对话:
+<code>SeedMessagesWithImages(buildSystemPrompt(options), prompt, images)</code>
+(<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:130</a>)。
+那个 <code>buildSystemPrompt</code> 决定了模型「开机」时看到的一切 —— 它的人格、可用的
+约定、当前工作目录、安全策略。这一课拆开它。
+</p>
+
+<blockquote>
+对齐 mission:系统提示常被当成一坨硬编码字符串。Zero 把它做成<strong>可组合、可预算、
+可缓存</strong>的分段结构 —— 这本身就是一个值得学的架构决策。
+</blockquote>
+
+<h2>核心洞察:一次拼装,每回合共享</h2>
+<p>
+<code>buildSystemPrompt</code> 在<strong>每次运行开头只调用一次</strong>,结果作为唯一的
+system 回合,被之后<em>每一个</em>回合复用。
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:62</a>
+</p>
+<div class="callout">
+<span class="label">为什么「一次」很重要</span>
+system 回合每回合字节完全一致 → 命中 provider 的 <strong>prompt 缓存</strong>。如果每回合
+重算(哪怕内容相同但顺序/空白有别),缓存就会失效,每回合都要为这几千 token 重新付费。
+「built once per run」这句注释不是随口一提,是省钱的关键。
+</div>
+
+<h2>拼装的形状:一串可选分段</h2>
+<p>
+函数体极其朴素 —— 一个字符串切片,每段独立判断「要不要加」,最后用 <code>\n\n</code>
+拼起来:
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:70</a>
+</p>
+<pre><code>sections := []string{core}                          // 核心「编码工艺」指令
+if a := modelPromptAddendum(model); a != "" { ... }  // 按模型家族的小贴士
+if s := sessionRuntimeContext(options); ... {}       // 当前 provider/model
+if p := approvedCommandPrefixContext(...); ... {}     // 已批准的命令前缀
+if seed := workspaceSeedContext(cwd); ... {}          // 工作区种子
+if ws := workspaceContext(cwd); ... {}                // cwd/OS/shell/git/项目约定/repo map
+if d := specialistDelegationContext(...); ... {}      // 可委派的 specialist 列表
+if style := responseStyleContext(...); ... {}         // /style 选择的回复风格
+if policy := confirmationPolicy; ... {}               // 安全确认策略(embed)
+return strings.Join(sections, "\n\n")</code></pre>
+<p>
+关键约定:<strong>每个分段函数在无内容时返回空串</strong>,拼装处用 <code>if != ""</code> 跳过。
+所以「没有 git 仓库」「没有 specialist」「风格是默认」这些情况<em>不占一个字节</em> ——
+缺席的上下文零成本,而不是留一堆「N/A」占位。
+</p>
+
+<h2>静态 vs 动态:两种来源</h2>
+<h3>静态:编译进二进制</h3>
+<p>
+核心指令和确认策略是两个 Markdown 文件,用 <code>//go:embed</code> 直接嵌进二进制:
+<code>system_prompt.md</code> 和 <code>confirmation_policy.md</code>。
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:19</a>
+这样「编码工艺」这类不变内容能被产品人员当文档来读、来改,而不必混在 Go 字符串里。
+</p>
+<h3>动态:每次运行从环境算出</h3>
+<p>
+<code>workspaceContext</code> 现算 cwd、<code>runtime.GOOS</code>、按 OS 给出 shell 语法
+(Windows cmd 还是 /bin/sh)、git 分支,再拼上项目约定和 repo map。
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:190</a>
+</p>
+
+<h2>两个值得单独看的分段</h2>
+
+<h3>① 按模型家族微调(<code>modelPromptAddendum</code>)</h3>
+<p>
+同一份核心提示,针对不同模型家族追加一小段 <code>&lt;model_guidance&gt;</code>:
+<a class="cite" href="../../zero/internal/agent/system_prompt_models.go">system_prompt_models.go:42</a>
+</p>
+<ul>
+<li>OpenAI:强调「用原生文件工具而非 shell 出 cat/sed」「一次调用处理一个文件」「本回合把任务做完」。</li>
+<li>Gemini:「优先专用工具」「简洁具体」「多步任务用 <code>update_plan</code>」。</li>
+<li>Anthropic:「除非用户要求,别加注释,匹配文件既有的注释密度」。</li>
+</ul>
+<p>这是「一个核心 + 少量厂商特调」的策略 —— 不为每家写一整套提示,只补差异。</p>
+
+<h3>② 摄入项目约定(<code>projectGuidelines</code>)</h3>
+<p>
+这正是 Zero 尊重 CLAUDE.md 式约定的地方。它按名字找项目上下文文件 ——
+<code>AGENTS.md</code> / <code>ZERO.md</code> / <code>.zero/AGENTS.md</code>
+(大小写无关,兼容 <code>AGENTS.MD</code>),沿 gitRoot→cwd 的目录链<em>逐级</em>读取。
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:38</a>、
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:223</a>
+</p>
+<p>
+但它有严格的<strong>字节预算</strong>:每文件 8 KiB、总计 32 KiB,超了就 UTF-8 安全地
+截断并标 <code>… (truncated)</code>。
+<a class="cite" href="../../zero/internal/agent/system_prompt.go">system_prompt.go:42</a>
+一个巨大的 AGENTS.md 不能把整个上下文窗口吃光 —— 用户约定重要,但不能无限膨胀。
+</p>
+
+<div class="callout warn">
+<span class="label">为什么这么设计</span>
+系统提示是<strong>组合</strong>而非<strong>拼接</strong>:独立分段 + 逐段预算 + 一次拼装。
+收益是三重的 —— 可缓存(每回合字节一致)、可预算(没有哪一段能撑爆窗口)、可维护(静态
+文档归文档、动态上下文归代码)。对照一坨手写的巨型字符串,这就是把提示当<em>工程产物</em>对待。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q"><code>buildSystemPrompt</code> 每次运行调用几次,为什么?</p>
+  <button class="opt">每回合一次,以反映最新对话</button>
+  <button class="opt">整次运行一次,让 system 回合可命中 prompt 缓存</button>
+  <button class="opt">每次工具调用一次</button>
+  <button class="opt">从不调用,提示是硬编码常量</button>
+  <div class="fb"
+    data-correct="对 —— 一次拼装、每回合共享,字节一致才能命中缓存、省下重复付费(system_prompt.go:62)。"
+    data-wrong="整次运行只一次:system 回合每回合字节一致 → 命中缓存(system_prompt.go:62)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">当前工作区没有 git、没有 specialist,系统提示里会怎样?</p>
+  <button class="opt">插入 "git: none" 之类的占位</button>
+  <button class="opt">整个拼装失败返回 fallback</button>
+  <button class="opt">对应分段返回空串被跳过,不占一个字节</button>
+  <button class="opt">用上一次运行的缓存值填充</button>
+  <div class="fb"
+    data-correct="对 —— 每个分段函数无内容时返回空串,拼装处 if != \"\" 跳过,缺席上下文零成本。"
+    data-wrong="空分段直接被跳过(if != \"\"),缺席的上下文不占字节(system_prompt.go:70)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">为什么项目约定文件(AGENTS.md 等)要有每文件 8KiB / 总 32KiB 的预算?</p>
+  <button class="opt">防止一个巨大的约定文件吃光上下文窗口</button>
+  <button class="opt">因为磁盘读取有大小限制</button>
+  <button class="opt">为了让文件能被 go:embed 嵌入</button>
+  <button class="opt">provider 要求 system 回合小于 32KiB</button>
+  <div class="fb"
+    data-correct="对 —— 用户约定重要但不能无限膨胀;超预算 UTF-8 安全截断(system_prompt.go:42)。"
+    data-wrong="是为了不让超大 AGENTS.md 撑爆窗口;超了就安全截断(system_prompt.go:42)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +62  ../zero/internal/agent/system_prompt.go        # buildSystemPrompt 拼装骨架
+less +190 ../zero/internal/agent/system_prompt.go        # workspaceContext 动态部分
+less +42  ../zero/internal/agent/system_prompt_models.go # 按家族的 addendum
+bat ../zero/internal/agent/system_prompt.md              # 核心「编码工艺」指令本体</code></pre>
+<p>
+读的顺序:先看 <code>buildSystemPrompt</code> 那份 <code>sections</code> 清单(<code>:70</code>),
+认出「一段 = 一个可选关注点」;再随便点开一两个分段函数,验证「无内容→空串→被跳过」这个
+一致的约定。最后读一遍 <code>system_prompt.md</code> 本体,看核心人格到底怎么写。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>workspaceSeedContext</code> 和 repo map 是什么、怎么生成的?」、
+「<code>confirmation_policy.md</code> 里的安全策略和第二课的权限关卡怎么呼应?」,
+或者「prompt 缓存在 provider 层是怎么落地的?」(那会引向 provider 适配那一课)。
+</div>
+
+<div class="nav">
+  <span>← 第四课:护栏</span>
+  <span>课程已覆盖循环核心五要素;下一步可转向 Provider 适配 / 沙箱 / TUI,由你选</span>
+</div>
+
+<footer>Zero 架构课程 · 第五课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

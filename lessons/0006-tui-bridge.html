@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第六课 — TUI:把流式 agent 接进 Elm 事件循环</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第六课</p>
+<h1>TUI:让阻塞的 agent 和单线程 UI 循环相处</h1>
+
+<p>
+前五课都在讲 <code>agent.Run</code> —— 一个会<strong>阻塞</strong>、会<strong>流式</strong>吐字、
+靠<strong>回调</strong>(<code>OnText</code>/<code>OnToolCall</code>…)对外说话的循环。而 Zero 的
+交互界面建在 Bubble Tea 上,那是一套 <strong>Elm 架构</strong>:单线程、消息驱动、
+<code>Model → Update → View</code> 严格轮转。这一课只回答一个问题:<em>这两种世界观怎么接到一起?</em>
+</p>
+
+<blockquote>
+对齐 mission:一个真实的 coding agent,难点从来不只是「让模型干活」,还有「把一个长时间运行、
+随时要用户拍板的后台任务,平滑地画进一个每秒刷新的终端界面」。这一课就是那座桥。
+</blockquote>
+
+<div class="callout">
+<span class="label">配套架构图</span>
+边读边看官方图更直观:<a href="../diagrams/zero-tui-flow.html">交互式 TUI 流程图</a>、<a href="../diagrams/tui-processing-sequence.html">TUI 处理详细序列图</a>(回调 → tea.Msg 的完整往返)、<a href="../diagrams/tui-sequence.html">TUI 交互时序(含排队输入)</a>。全部图见<a href="index.html">课程目录</a>末尾。
+</div>
+
+<h2>核心张力:两种时间观</h2>
+<ul>
+<li><strong>agent 循环</strong>是命令式、阻塞式的:它一路跑到底,中途通过回调把增量吐出来,
+遇到要授权时就地<em>停下等答复</em>。</li>
+<li><strong>Bubble Tea</strong>是纯函数式的:你不能从外部线程改 UI 状态;一切变化只能是
+「一条 <code>tea.Msg</code> 进 <code>Update</code>,返回新 model」。<code>Update</code> 是单线程的,
+绝不能在里面阻塞 —— 阻塞了整个界面就冻住。</li>
+</ul>
+<p>矛盾很直接:agent 要阻塞,UI 循环不能阻塞。Zero 用三个动作化解。</p>
+
+<h2>动作一:agent 跑在一个 <code>tea.Cmd</code> 里</h2>
+<p>
+Bubble Tea 的 <code>Cmd</code> 就是「<code>func() tea.Msg</code>」—— 框架会在<strong>后台 goroutine</strong>
+里执行它,执行完把返回的 <code>Msg</code> 投回 <code>Update</code>。Zero 把整个 <code>agent.Run</code>
+包进这样一个 Cmd:
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:4104</a>
+</p>
+<pre><code>func (m model) runAgentWithOptions(...) tea.Cmd {
+    return func() tea.Msg {          // ← 在后台 goroutine 运行
+        ...
+        result, err := agent.Run(runCtx, prompt, m.provider, options) // loop.go 的循环
+        ...
+    }
+}</code></pre>
+<p>
+提交它的地方在用户回车后:<code>tea.Batch(m.runAgent(...), m.spinner.Tick)</code>
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:3931</a> ——
+agent 在后台跑,spinner 在前台照常转。<code>Update</code> 从不等 agent;它只是发射了一个 Cmd 就返回了。
+</p>
+
+<h2>动作二:回调 → 消息(单向流)</h2>
+<p>
+agent 在后台吐字,怎么让画面动?入口在 <code>Run</code> 的启动处
+<a class="cite" href="../../zero/internal/tui/run.go">run.go:28</a> ——
+每个从 runtime 冒出来的消息都被灌进 <code>program.Send</code>:
+</p>
+<pre><code>options.RuntimeMessageSink = func(msg tea.Msg) {
+    ...
+    if program != nil { program.Send(msg) }   // 唯一合法的「外部→UI」通道
+}</code></pre>
+<p>
+于是 TUI 把 agent 的每个回调都改写成「造一条 <code>tea.Msg</code> 丢进 sink」。比如流式文本:
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:4197</a>、
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:4600</a>
+</p>
+<pre><code>options.OnText = func(delta string) { m.sendAgentText(runID, delta) }
+// sendAgentText:
+m.runtimeMessageSink(agentTextMsg{runID: runID, delta: delta})</code></pre>
+<p>
+<code>OnToolCall</code>→<code>agentRowMsg</code>、<code>OnReasoning</code>→<code>agentReasoningMsg</code>、
+<code>OnUsage</code>→<code>agentUsageMsg</code>… 每类流事件都有一个对应的私有 <code>Msg</code> 类型
+(<a class="cite" href="../../zero/internal/tui/model.go">model.go:393</a> 起一长串)。
+<code>Update</code> 收到后才真正改 model:
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:1553</a>
+</p>
+<pre><code>case agentTextMsg:
+    if msg.runID != m.activeRunID { return m, nil }  // ← 丢弃过期 run 的消息
+    m.streamingText += msg.delta
+    ...</code></pre>
+<div class="callout">
+<span class="label">为什么要 <code>runID</code> 守卫</span>
+消息是异步到达的。用户可能已经 Ctrl-C 取消了这次 run、又发起了新的一次;旧 goroutine 在被
+<code>ctx</code> 掐断前还会吐出几条残余消息。每条消息都带 <code>runID</code>,<code>Update</code> 一进门就比对
+<code>m.activeRunID</code>,不匹配直接丢弃 —— 这样陈旧 run 的尾音不会污染新画面。这是异步桥接的必备卫生。
+</div>
+
+<h2>动作三:要用户拍板时 —— 用 channel 会合</h2>
+<p>
+单向的「吐字→画面」好办。难的是<strong>双向</strong>:agent 要请求权限,<em>必须停下</em>等用户点
+「允许 / 拒绝」,拿到答复才能继续。但 agent 在后台 goroutine,用户的点击在 UI 线程 —— 两条
+时间线要在此<strong>会合</strong>。Zero 的做法是一个 channel:
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:4215</a>
+</p>
+<pre><code>options.OnPermissionRequest = func(ctx, request) (Decision, error) {
+    decisionCh := make(chan agent.PermissionDecision, 1)
+    m.sendPermissionRequest(runID, request, func(d) { decisionCh <- d })  // 把「问题」丢进UI
+    select {
+    case decision := <-decisionCh:   // ← agent goroutine 在这里阻塞等答复
+        return decision, nil
+    case <-ctx.Done():               // ← 但 ctx 取消能把它唤醒,不会永久卡死
+        return denyDecision, ctx.Err()
+    }
+}</code></pre>
+<p>
+读一遍这段时间线:<strong>agent goroutine</strong> 造一个 <code>permissionRequestMsg</code>(含一个回调闭包)
+丢进 sink,然后<em>阻塞</em>在 <code>&lt;-decisionCh</code> 上。<strong>UI 线程</strong>照常 <code>Update</code>、
+把权限弹窗画出来、等用户按键;用户一选,<code>Update</code> 调用那个闭包,把决定送进
+<code>decisionCh</code>。agent goroutine 立刻被唤醒,<code>agent.Run</code> 从容继续。
+</p>
+<div class="callout warn">
+<span class="label">为什么这样才对</span>
+关键在:<strong>阻塞发生在 agent goroutine,而不在 <code>Update</code></strong>。UI 循环全程没有卡 ——
+它只是画了个弹窗、收了个按键。真正「等」的是后台那条线,而它等得起。<code>ctx.Done()</code>
+那一路则保证:哪怕用户始终不答、或直接取消,goroutine 也能脱身而不泄漏。<code>OnAskUser</code>
+(<a class="cite" href="../../zero/internal/tui/model.go">model.go:4248</a>)用的是<em>一模一样</em>的
+channel-会合模式,只是载荷从「权限决定」换成「问答答案」。
+</div>
+
+<h2>顺带一提:入口的 fail-fast</h2>
+<p>
+<code>Run</code> 开头先做一件朴素但重要的事:确认 stdin 真是个 TTY。
+<a class="cite" href="../../zero/internal/tui/run.go">run.go:21</a>
+因为 Bubble Tea 在管道/重定向输入下会<em>永久阻塞</em>等永远不来的事件(想想 <code>echo "" | zero</code>)。
+与其挂死,不如立刻退出并指向 headless 路径(<code>zero exec</code>)。「fail closed」—— 凡不是
+已验证的终端就拒绝进交互壳。
+</p>
+
+<h2>一句话总结这座桥</h2>
+<pre><code>阻塞的 agent  ──跑在──▶  tea.Cmd (后台 goroutine)
+    │ 回调                    │ 返回值
+    ▼                         ▼
+RuntimeMessageSink ──▶ program.Send ──▶ Update(msg) ──▶ 新 model ──▶ View
+    ▲                                       │
+    └────────── channel 会合(权限/问答)◀───┘</code></pre>
+<p>
+单向的流(文本/工具/用量)是「回调造消息、Send 投递、Update 消费」;双向的拍板(权限/问答)
+是「goroutine 阻塞在 channel、Update 填答案唤醒它」。整套 UI 状态永远只被 <code>Update</code> 一个
+地方修改 —— 后台 goroutine 从不直接碰 model。这就是 Elm 架构和阻塞任务和平共处的全部秘密。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q"><code>agent.Run</code> 这个会阻塞的循环,在 TUI 里跑在哪?</p>
+  <button class="opt">直接在 Update 函数体内同步调用</button>
+  <button class="opt">包在一个 tea.Cmd 里,由框架在后台 goroutine 执行</button>
+  <button class="opt">在 View 渲染时惰性触发</button>
+  <button class="opt">在一个独立进程里通过 IPC 通信</button>
+  <div class="fb"
+    data-correct="对 —— runAgentWithOptions 返回 func() tea.Msg,Cmd 在后台 goroutine 跑,Update 从不阻塞(model.go:4104)。"
+    data-wrong="它是一个 tea.Cmd(func() tea.Msg),框架在后台 goroutine 执行(model.go:4104);Update 里同步跑会冻住界面。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">agent 后台流式吐出的文本,怎么变成画面更新?</p>
+  <button class="opt">goroutine 直接修改 model 的 streamingText 字段</button>
+  <button class="opt">View 每帧主动去 agent 拉取最新文本</button>
+  <button class="opt">回调造一条 agentTextMsg 经 sink→program.Send 投进 Update</button>
+  <button class="opt">写进共享内存,靠定时器轮询</button>
+  <div class="fb"
+    data-correct="对 —— OnText→sendAgentText→RuntimeMessageSink→program.Send→Update 消费(run.go:28 / model.go:4600 / :1553)。"
+    data-wrong="唯一合法通道是造 Msg 丢进 sink,由 program.Send 投回 Update;goroutine 绝不直接改 model(model.go:4600)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">agent 请求权限、必须等用户答复时,阻塞发生在哪里?</p>
+  <button class="opt">agent goroutine 阻塞在 &lt;-decisionCh,UI 循环全程不卡</button>
+  <button class="opt">Update 函数阻塞等用户按键</button>
+  <button class="opt">整个程序暂停,直到收到信号</button>
+  <button class="opt">View 停止渲染直到决定返回</button>
+  <div class="fb"
+    data-correct="对 —— goroutine 阻塞在 channel 上等 Update 填答案;ctx.Done() 保证取消时能脱身(model.go:4215)。"
+    data-wrong="阻塞在后台 agent goroutine 的 &lt;-decisionCh,不在 Update;UI 只是画弹窗收按键(model.go:4215)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +14   ../zero/internal/tui/run.go        # Run 入口:TTY 检查 + sink 包 program.Send
+less +4104 ../zero/internal/tui/model.go      # runAgentWithOptions:agent 装进 tea.Cmd
+less +4197 ../zero/internal/tui/model.go      # 回调→Msg 的改写(OnText/OnToolCall/…)
+less +4215 ../zero/internal/tui/model.go      # OnPermissionRequest:channel 会合
+less +1553 ../zero/internal/tui/model.go      # Update 消费 agentTextMsg + runID 守卫</code></pre>
+<p>
+读的顺序:先看 <code>run.go</code> 那 60 行,认出 <code>RuntimeMessageSink</code> 就是唯一的
+「外部→UI」阀门;再跳到 <code>runAgentWithOptions</code>,看 <code>agent.Run</code> 怎么被包进
+<code>func() tea.Msg</code>;最后对读 <code>OnText</code>(单向)和 <code>OnPermissionRequest</code>
+(双向 channel 会合)—— 这一对就是整座桥的两种形态。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「Bubble Tea 的 <code>Cmd</code>/<code>Msg</code>/<code>Batch</code> 到底怎么调度的?」、
+「<code>View</code> 返回的是什么、4657 行的 model 怎么组织渲染的?」,
+或者「取消一次 run(Ctrl-C)时 <code>ctx</code> 是怎么把后台 goroutine 干净地掐断的?」
+</div>
+
+<div class="nav">
+  <span>← 第五课:系统提示</span>
+  <span>循环核心五要素已覆盖;这一课接上了「人机界面」。下一步可选:Provider 适配层 / 沙箱引擎 / 会话持久化(/resume)</span>
+</div>
+
+<footer>Zero 架构课程 · 第六课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十七课 — 工具注册与分发:一个极小接口 + 一扇可选能力,穿一条唯一咽喉</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十七课</p>
+<h1>工具注册表:5 个方法的核心接口,和它身后一排「可选能力」</h1>
+
+<p>
+第二课讲了 <code>executeToolCall</code> 那道<em>闸门</em> —— 什么时候准跑。这一课讲被它调度的东西<strong>本身长什么样</strong>:
+一个工具怎么注册、怎么被分发、怎么在<em>不改基接口</em>的前提下长出新能力。答案是 Zero 工具系统的中枢:
+<code>Registry</code> + 一个极小的 <code>Tool</code> 接口
+<a class="cite" href="../../zero/internal/tools/types.go">types.go:119</a>。
+</p>
+
+<blockquote>
+对齐 mission:一个 coding agent 的能力边界,就是它工具集的边界。你要能<em>随时加一个新工具</em>(甚至外部 MCP 工具),
+又不能让每加一个都去动核心循环、也不能让某个工具作者忘了检查权限就闯了祸。这一课的功夫,是看 Zero 怎么用
+「<strong>一个必须实现的小接口 + 一排可选接口 + 一条唯一分发咽喉</strong>」同时拿下<em>可扩展</em>与<em>安全</em>这两个通常打架的目标。
+</blockquote>
+
+<h2>核心接口小到只有 5 个方法</h2>
+<pre><code>type Tool interface {
+    Name() string
+    Description() string
+    Parameters() Schema          // 喂给模型的 JSON schema
+    Safety() Safety              // 声明:副作用 + 权限 + 理由
+    Run(ctx, args) Result        // 真正干活
+}                                                // types.go:119</code></pre>
+<p>
+就这么点。一个工具只要答得出「我叫什么、干什么、参数长啥样、我有多危险、怎么跑」,就能被注册
+(<code>Register</code> <a class="cite" href="../../zero/internal/tools/registry.go">registry.go:96</a>,一个 <code>map[string]Tool</code>)。
+注意 <code>Safety</code> <a class="cite" href="../../zero/internal/tools/types.go">types.go:60</a>:它是<strong>声明式元数据</strong>
+(<code>SideEffect</code>/<code>Permission</code>/<code>Reason</code>)—— 工具<em>声明</em>自己的副作用和危险度,但<strong>绝不自己检查权限</strong>。
+判定权归第十三课的沙箱引擎。工具说「我是什么」,引擎决定「你能不能跑」—— 策略与机制分离。
+</p>
+
+<h2>可选能力:不改基接口,靠「结构类型 + 分发时断言」长出来</h2>
+<p>
+5 个方法是<em>所有</em>工具的最小契约。但有的工具需要更多上下文:要拿到沙箱引擎、要拿到进度回调(第十六课的
+<code>Progress</code>)。若把这些塞进基接口,那所有工具都得被迫实现一堆用不到的方法。Zero 的选择是一排<strong>可选接口</strong>
+——工具<em>愿意</em>就实现,注册表在分发时用类型断言探一下:
+</p>
+<pre><code>type sandboxAwareTool interface { RunWithSandbox(ctx, args, *sandbox.Engine) Result }  // registry.go:45
+type optionsAwareTool interface { RunWithOptions(ctx, args, RunOptions) Result }        // registry.go:49
+type deferredTool        interface { Deferred() bool }                                  // registry.go:56
+type deferralEligibleTool interface { DeferralEligible() bool }                         // registry.go:79</code></pre>
+<p>
+分发时<strong>「谁能耐大用谁」</strong>:<code>RunWithOptions</code> &gt; <code>RunWithSandbox</code> &gt; 裸 <code>Run</code>
+(<a class="cite" href="../../zero/internal/tools/registry.go">registry.go:177</a>)。一个工具只要<em>结构上</em>多长出一个方法,就自动升级到更富的分发路径——
+不用改 <code>Tool</code> 接口,不用动其他工具,更不用在核心循环里加 <code>if type==...</code>。这与第九课「一个 Provider 接口喂饱各家」是同一手 Go 结构类型的活用。
+</p>
+
+<h2>唯一咽喉:<code>RunWithOptions</code> 一条路,横切逻辑全收于此</h2>
+<p>
+所有工具调用<strong>只有一条真正的分发路径</strong>——<code>RunWithOptions</code>
+<a class="cite" href="../../zero/internal/tools/registry.go">registry.go:117</a>。裸 <code>Run</code> 只是它的薄封装。既然唯一,那些「每个工具都必须做、但工具作者最容易忘」的横切关注点,就都钉死在这一处:
+</p>
+<pre><code>func (r *Registry) RunWithOptions(ctx, name, args, opts) Result {
+    defer scrubResultSecrets(&result)         // ① 出口一律脱敏      registry.go:121
+    tool := r.Get(name)                        // 未知工具直接拒       :123
+    if rej, ok := tool.(PrePermissionRejecter); ok { … }   // ② 权限前本地拦截 :127
+    perm := r.effectiveToolPermission(tool, args)          // ③ 算有效权限  :133
+    decision := opts.Sandbox.Evaluate(…)                   // ④ 交沙箱裁决  :137
+    switch decision.Action { Deny→拒; Prompt→按授权; }      //             :147
+    // ⑤ 按能力择优分发
+    if t, ok := tool.(optionsAwareTool); ok { return t.RunWithOptions(…) }  // :177
+    if t, ok := tool.(sandboxAwareTool); ok { return t.RunWithSandbox(…) }  // :185
+    return tool.Run(ctx, args)                                              // :192
+}</code></pre>
+<div class="callout">
+<span class="label">为什么「唯一咽喉」是安全的关键</span>
+权限门、沙箱评估(第十三课)、密钥擦洗(<code>scrubResultSecrets</code>
+<a class="cite" href="../../zero/internal/tools/registry.go">registry.go:206</a>,呼应第十课 Redact)——全部收在这一个函数里。
+于是<strong>一个工具作者<em>无法</em>忘记检查权限或擦洗密钥</strong>:他根本没机会,这些不由工具做,而由咽喉替所有工具统一做。
+<code>defer</code> 更保证了哪怕中途 return,出口脱敏也必然执行。<em>可扩展</em>(随便加工具)与<em>安全</em>(没人能绕过检查)这对通常打架的目标,就靠「小接口 + 唯一咽喉」同时拿下。
+</div>
+
+<h2>权限只能「放松」,不能「收紧」:<code>ArgsPermissioner</code></h2>
+<p>
+<code>effectiveToolPermission</code> <a class="cite" href="../../zero/internal/tools/registry.go">registry.go:197</a>
+默认取工具<em>静态</em>声明的 <code>Safety.Permission</code>。但有的工具能<em>就这一次具体调用</em>证明自己无害——比如 <code>Task</code>
+派出去的是个只读子 agent(第十六课的 <code>IsReadOnlySpecialist</code>)。这时它实现 <code>ArgsPermissioner</code>
+<a class="cite" href="../../zero/internal/tools/types.go">types.go:134</a>,把 <code>Prompt</code> 降成 <code>Allow</code>。
+</p>
+<div class="callout warn">
+<span class="label">方向是单向的:只准降,不准升</span>
+<code>PermissionForArgs</code> 的契约是<strong>只能放松</strong>:能证明这次调用安全就放行,<em>拿不准就必须退回更严的静态权限</em>。
+为什么不许它反向收紧?因为收紧的判定权属于沙箱引擎(第十三课),工具自评「我更危险」会让判定散落回各工具、破坏策略/机制分离。
+放松是「工具用自己独有的 args 知识补充一条豁免」,收紧则是越权做引擎的活。
+</div>
+
+<h2>延迟加载:MCP 工具一多,得先「藏起来」再按需现身</h2>
+<p>
+接入一堆 MCP 工具后,把<em>每个</em>工具的 schema 都塞进 prompt 会把上下文撑爆(第五课的 prompt 预算)。所以部分工具<strong>延迟广告</strong>:
+平时不进 prompt,靠 tool_search 按需捞出。<code>IsDeferred</code>
+<a class="cite" href="../../zero/internal/tools/registry.go">registry.go:67</a> 判它藏不藏,而
+<code>DeferralEligible</code> <a class="cite" href="../../zero/internal/tools/registry.go">registry.go:88</a> 有个微妙作用:
+</p>
+<p>
+延迟机制只在工具总数<em>超过阈值</em>时启用。<code>DeferralEligible</code> 让「可被延迟的工具数」保持稳定——
+否则临时 un-defer 一个工具,可能把计数压到阈值之下,反手把<em>所有</em>工具都强行曝光回 prompt 里,前功尽弃。它把计数与「当前谁被藏」解耦,让阈值判定稳定。
+</p>
+
+<h2>组合:核心工具集也是「按 scope 拼出来」的</h2>
+<p>
+最后一层:哪些工具进注册表,本身也是分层组合的。<code>CoreReadOnlyToolsScoped</code>
+<a class="cite" href="../../zero/internal/tools/registry.go">registry.go:237</a>、<code>CoreWriteToolsScoped</code> <a class="cite" href="../../zero/internal/tools/registry.go">:258</a>、
+<code>CoreShellToolsScoped</code> <a class="cite" href="../../zero/internal/tools/registry.go">:268</a>、<code>CoreNetworkTools</code> <a class="cite" href="../../zero/internal/tools/registry.go">:277</a>
+各产一批,<code>CoreToolsScoped</code> <a class="cite" href="../../zero/internal/tools/registry.go">:290</a> 按 scope 拼总。
+工具集边界=agent 能力边界,而这个边界是<em>可按场景裁剪</em>的:只读会话就不装 write/shell,一如第五课的 system prompt 按预算裁段。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">一个工具怎样在<em>不改动基接口</em>的前提下获得额外能力?</p>
+  <button class="opt">在核心循环里为该工具补一段专用的类型判断分支逻辑处理</button>
+  <button class="opt">实现一个可选接口,注册表分发时按类型断言择优调用它</button>
+  <button class="opt">把新能力所需方法直接加进所有工具共享的那个基接口里</button>
+  <button class="opt">继承一个已实现该能力的父工具从而获得它全部的方法集</button>
+  <div class="fb"
+    data-correct="对 —— 可选接口(sandboxAwareTool/optionsAwareTool)靠 Go 结构类型,工具愿意就实现;分发时类型断言,richest-wins:RunWithOptions>RunWithSandbox>Run(registry.go:177)。基接口和其他工具都不动。"
+    data-wrong="靠可选接口 + 分发时类型断言:工具多长一个方法就自动升级到更富路径,基接口不改、核心循环不加 if(registry.go:45/:177)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">工具的 <code>Safety</code> 字段在整个权限体系里扮演什么角色?</p>
+  <button class="opt">它是工具运行时自行调用的一段权限检查与拦截的逻辑</button>
+  <button class="opt">它记录该工具历史上每一次被授权放行的完整审计日志</button>
+  <button class="opt">它是声明式元数据,喂给沙箱引擎由其裁决能否跑</button>
+  <button class="opt">它是一份可被调用方随时覆盖重写的动态权限配置项</button>
+  <div class="fb"
+    data-correct="对 —— Safety(SideEffect/Permission/Reason)是声明式元数据:工具只『声明』自己多危险,绝不自查权限;判定权归第十三课沙箱引擎。策略与机制分离(types.go:60)。"
+    data-wrong="Safety 是声明式元数据,工具声明『我是什么』,引擎决定『能不能跑』——工具从不自己检查权限(types.go:60)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">为什么所有工具调用都必须穿过 <code>RunWithOptions</code> 这一条路?</p>
+  <button class="opt">它是唯一分发点,权限沙箱密钥擦洗等横切逻辑都收于此</button>
+  <button class="opt">它是性能最优的分发路径,能显著降低每次调用的总开销</button>
+  <button class="opt">它是唯一能够正确并发调度多个工具同时运行起来的入口</button>
+  <button class="opt">它是历史遗留的兼容入口,新工具其实可以选择绕开它跑</button>
+  <div class="fb"
+    data-correct="对 —— 唯一咽喉让权限门/沙箱评估/scrubResultSecrets 全钉在一处,defer 保证出口必脱敏;工具作者没机会忘记检查。可扩展与安全同时拿下(registry.go:117/:121)。"
+    data-wrong="RunWithOptions 是唯一分发路径,横切关注点(权限、沙箱、密钥擦洗)全收于此;defer scrubResultSecrets 保证出口一律脱敏(registry.go:117)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +119 ../zero/internal/tools/types.go       # Tool 接口 5 方法 + Safety 声明式元数据
+less +134 ../zero/internal/tools/types.go       # ArgsPermissioner:只准放松,不准收紧
+less +117 ../zero/internal/tools/registry.go    # RunWithOptions:唯一咽喉 + defer 脱敏 + 择优分发
+less +197 ../zero/internal/tools/registry.go    # effectiveToolPermission:静态权限 vs args 放松
+less +206 ../zero/internal/tools/registry.go    # scrubResultSecrets:出口边界脱敏
+less +290 ../zero/internal/tools/registry.go    # CoreToolsScoped:按 scope 拼出核心工具集</code></pre>
+<p>
+读的顺序:先看 <code>types.go:119</code> 的 5 方法接口,体会它<em>刻意</em>的小。再看 <code>registry.go:45</code> 那排可选接口和 <code>:177</code> 的择优分发——
+理解「能力靠结构类型长出来」。最后精读 <code>RunWithOptions</code> 全身:注意 <code>defer</code> 脱敏、权限门、沙箱评估怎么全挤在这一个函数里——
+这就是「一条唯一咽喉同时拿下可扩展与安全」的全部现场。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「MCP 工具是怎么被<em>接进</em>这张注册表的(外部进程的工具如何变成一个满足 <code>Tool</code> 接口的对象、schema 怎么来)?」、
+「<code>PrePermissionRejecter</code>(<a class="cite" href="../../zero/internal/tools/types.go">types.go:141</a>)为什么必须是本地确定性的、它和沙箱评估的分工是什么?」,
+或者换个大块:「权限授权的持久化与 scope 匹配——一次 <code>/allow</code> 之后,下次同类调用怎么被认成『已授权』(grants.go / grant_scope.go)?」</div>
+
+<div class="nav">
+  <span>← 第十六课:specialist 进度回流</span>
+  <span>工具系统的「注册 + 分发」中枢已覆盖。下一步可选:MCP 接入 / 权限授权持久化与 scope 匹配 / swarm 编排骨架</span>
+</div>
+
+<footer>Zero 架构课程 · 第十七课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第一课 — Agent 主循环</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第一课</p>
+<h1>Agent 主循环:对「回合」的一次 fold</h1>
+
+<p>
+剥掉流式、重试、权限这些外壳,一个编码 agent 做的事本质上就是一个循环。Zero
+把它叫作 <code>Run</code>,正是这个函数让 Zero 成为一个 <em>agent</em>,而不是一个
+聊天框。吃透它,其余 67 个包都只是配角。
+</p>
+
+<blockquote>
+对齐 mission:这一课交付你目标的前半部分 ——
+<em>把一个 prompt 从输入追踪到最终回答,并说出每一步对应的具体函数</em>。学完
+你应该能凭记忆把整个循环讲出来。
+</blockquote>
+
+<div class="callout">
+<span class="label">配套架构图</span>
+边读边看官方图更直观:<a href="../diagrams/zero-agent-loop-flow.html">agent.Run 循环流程图</a>(分支与终止条件全景)、<a href="../diagrams/zero-agent-loop-sequence.html">agent.Run 单轮时序</a>(各组件调用先后)。全部图见<a href="index.html">课程目录</a>末尾。
+</div>
+
+<h2>一句话模型</h2>
+<p>
+一个 agent 回合就是:<strong>问模型 → 如果它要求调用工具,就执行工具、把结果喂回去
+→ 重复;如果它没要求调用工具,那段文本就是答案。</strong>
+这个循环是对<em>回合(turns)</em>的一次 fold,而<em>工具结果</em>就是每一轮不断
+增长的累加器。
+</p>
+
+<p>
+在 Zero 里这一切都在一个函数 <code>Run</code> 中,它的骨架是一个有上限的
+<code>for</code> 循环:
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:107</a>
+</p>
+
+<pre><code>func Run(ctx, prompt, provider, options) (Result, error) {
+    messages := SeedMessagesWithImages(buildSystemPrompt(options), prompt, images)   // :130 初始化对话
+    for turn := 0; turn &lt; maxTurns; turn++ {                                        // :149 回合上限
+        exposed, _ := partitionTools(...)                                           // :156 本回合暴露哪些工具
+        messages = compactor.maybeCompact(ctx, provider, messages, exposed)         // :161 压缩以守住窗口
+        stream, _ := streamWithReconnect(ctx, provider, request, ...)               // :178 问模型
+        collected := CollectStreamWithOptions(ctx, stream, forwardingOpts)          // :273 抽干流
+        messages = append(messages, assistantMessage(collected))                    // :348 记录回复
+
+        if len(collected.ToolCalls) == 0 {                                          // :357
+            result.FinalAnswer = collected.Text                                     // :453 ← 出口:这就是答案
+            return result, nil
+        }
+        for _, call := range collected.ToolCalls {                                  // :478
+            toolResult := executeToolCall(ctx, registry, call, mode, options)       // :482 执行工具
+            messages = append(messages, toolMessage(toolResult))                    // :495 把结果喂回去
+        }
+        // 继续下一回合,此时上下文里已带上工具结果
+    }
+}</code></pre>
+
+<p>
+这个 2700 行文件里的其它一切 —— 重连、压缩、护栏、自我纠错、模型升级 —— 都挂在这个
+骨架上。先学骨架;剩下的都是骨架上的分支。
+</p>
+
+<h2>一个回合的四个动作</h2>
+
+<h3>1 · 先播种,再构建请求</h3>
+<p>
+进入循环前,Zero 先构建初始的 <code>messages</code> 切片:系统提示 + 用户 prompt
+(+ 可能的图片)。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:130</a>
+这个切片<strong>就是</strong>对话状态 —— 循环只会往里 append。每个回合把它拷进一个
+<code>CompletionRequest</code>,连同<em>本回合</em>可用的工具定义一起发出去。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:162</a>
+</p>
+
+<h3>2 · 问模型,抽干流</h3>
+<p>
+模型通过唯一一道窄接缝触达 —— <code>Provider</code> 接口,一个单一的流式方法:
+<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:209</a>
+</p>
+<pre><code>type Provider interface {
+    StreamCompletion(ctx, request) (&lt;-chan StreamEvent, error)
+}</code></pre>
+<p>
+正是这一个方法,让 Zero 能支持 25+ 家 provider:循环里从不提 OpenAI 或 Anthropic ——
+它只讲 <code>StreamEvent</code>。<code>CollectStreamWithOptions</code> 把 channel
+抽干成一个 <code>CollectedStream</code>,内含最终的 <code>Text</code> 和任何
+<code>ToolCalls</code>,同时把增量实时转发给 TUI。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:273</a>
+</p>
+
+<h3>3 · 分叉:有没有工具调用?</h3>
+<p>
+这一个分支就是「继续 vs 结束」的全部判定逻辑:
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:357</a>
+</p>
+<ul>
+<li><strong>零个工具调用</strong> → 模型没别的要做了,它的文本就是最终答案,循环返回。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:453</a></li>
+<li><strong>一个或多个工具调用</strong> → 模型想动手。Zero 逐个执行,每个调用 append 一条
+<code>tool</code> 角色的消息,然后落入下一轮迭代,让模型对它刚学到的东西作出反应。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:478</a></li>
+</ul>
+<p>
+注意这个不变量:<strong>每个已声明的工具调用都恰好得到一条工具结果消息</strong>,
+即使护栏在批次中途叫停 —— Zero 会为剩余调用回填「已中止」占位结果,好让记录下来的
+历史对严格的 provider 重放仍然有效。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:509</a>
+</p>
+
+<h3>4 · 天花板</h3>
+<p>
+<code>for turn := 0; turn &lt; maxTurns</code> 这个上限(默认 12)是安全网:自然完成会
+经由「无工具调用」路径提前退出;触到天花板意味着 agent 在半途被截断,循环之后单独处理。
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:112</a>、
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:628</a>
+</p>
+
+<div class="callout">
+<span class="label">要记住的心智模型</span>
+<code>messages</code> 是一条只追加的磁带。每个回合写入一条 assistant 记录,然后是
+零条或多条 tool 记录。模型每个回合都读整条磁带。所谓「agent 性」不过是:
+<em>模型的输出能把内容加进它自己的下一次输入。</em>
+</div>
+
+<h2>动手回忆 —— 别只是点头</h2>
+<p>先作答,再回看。费力的回忆才能让知识真正扎根。</p>
+
+<div class="quiz" data-answer="1">
+  <p class="q">Zero 的 <code>Run</code> 循环凭什么判定一次运行结束?</p>
+  <button class="opt">模型输出一个特殊的结束标记</button>
+  <button class="opt">模型返回一个没有工具调用的回合</button>
+  <button class="opt">工具结果里带了一个成功标志位</button>
+  <button class="opt">上下文窗口被完全填满</button>
+  <div class="fb"
+    data-correct="正是 —— 没有工具调用就意味着那段文本是最终答案(loop.go:357、:453)。"
+    data-wrong="是 loop.go:357 的「无工具调用」分支 —— 一个纯文本回合就是答案。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">为什么 Zero 支持 25+ 家 provider 却不用改动循环?</p>
+  <button class="opt">每家 provider 各自带一份 Run 的拷贝</button>
+  <button class="opt">循环按名字对每家 provider 做特判</button>
+  <button class="opt">所有 provider 都藏在一个流式接口后面</button>
+  <button class="opt">provider 由模型在运行时选择</button>
+  <div class="fb"
+    data-correct="对 —— Provider 接口(types.go:209)是唯一接缝;循环只讲 StreamEvent,不讲厂商 API。"
+    data-wrong="是那个单方法的 Provider 接口(types.go:209)—— 循环从不点名任何厂商。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">一个工具执行完之后,循环拿它的结果做什么?</p>
+  <button class="opt">把它 append 成一条消息,然后进入下一回合</button>
+  <button class="opt">立即把它作为最终答案返回</button>
+  <button class="opt">直接发给 TUI 然后丢弃</button>
+  <button class="opt">存进一个单独的结果数据库</button>
+  <div class="fb"
+    data-correct="对 —— 工具结果被 append 进 messages(loop.go:495),循环继续迭代,好让模型作出反应。"
+    data-wrong="它把结果 append 进 messages(loop.go:495)并再次循环 —— 这个反馈正是关键所在。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<p>
+把 <code>Run</code> 从头到尾读一遍 —— 只看骨架,略过重试/压缩的分支。打开它,循着上面的
+四个动作走:
+</p>
+<pre><code>less +107 ../zero/internal/agent/loop.go
+# 或在你的编辑器里:  zero/internal/agent/loop.go:107</code></pre>
+<p>
+别想一口气吃完整个文件。找到 <code>for turn</code> 那行、
+<code>len(collected.ToolCalls) == 0</code> 那个分叉,以及内层的
+<code>for _, call := range collected.ToolCalls</code>。这三个锚点就是整个循环。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 现在适合追问的问题:
+「带我走一遍真实 prompt 的第 2 个回合发生了什么」、「给我看一个
+<code>StreamEvent</code> 长什么样」,或者「<code>executeToolCall</code> 里面到底
+是什么?」(那就是第二课)。
+</div>
+
+<div class="nav">
+  <span>←(课程开始)</span>
+  <span>下一课:第二课 —— 深入 <code>executeToolCall</code>:权限与沙箱 →</span>
+</div>
+
+<footer>Zero 架构课程 · 第一课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

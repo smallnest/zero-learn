@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zero 架构课程 — 目录</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 课程目录</p>
+<h1>读一个真实的终端 coding agent,一课一个能自己复刻的零件</h1>
+
+<p>
+这门课基于 <code>github.com/Gitlawb/zero</code> 的一手源码,把一个现代终端 coding agent 拆成二十个<em>可独立带走</em>的架构决定。
+每一课只讲一件事,配三道回忆测验和一份「接下来该读的源码」清单。建议按序读——后面的课常回指前面的课。
+</p>
+
+<blockquote>
+Mission:通过读真实源码理解一个现代终端 coding agent 的架构,直到能自己画出一个可比的 agent 骨架。
+</blockquote>
+
+<div class="idx-group">
+<h2>一 · 核心循环与上下文</h2>
+<p class="sub">agent 怎么跑起来、每一步怎么被守住、上下文怎么不爆</p>
+<ul class="idx-list">
+<li><a href="0001-the-agent-loop.html"><span class="idx-num">01</span><span class="idx-body"><span class="idx-title">Agent 主循环</span><span class="idx-hook">流式调模型 → 收工具调用 → 执行 → 回灌,一个 for 循环就是 agent 的心跳</span></span></a></li>
+<li><a href="0002-execute-tool-call.html"><span class="idx-num">02</span><span class="idx-body"><span class="idx-title">executeToolCall:工具执行前的层层关卡</span><span class="idx-hook">一次工具调用要穿过哪几道闸门才准跑</span></span></a></li>
+<li><a href="0003-context-compaction.html"><span class="idx-num">03</span><span class="idx-body"><span class="idx-title">上下文压缩:守住模型窗口</span><span class="idx-hook">对话变长时怎么塌缩历史又保住关键结构</span></span></a></li>
+<li><a href="0004-guardrails.html"><span class="idx-num">04</span><span class="idx-body"><span class="idx-title">护栏:让循环不至于失控</span><span class="idx-hook">硬停 vs 一次性提醒,两类护栏各管什么</span></span></a></li>
+<li><a href="0005-system-prompt.html"><span class="idx-num">05</span><span class="idx-body"><span class="idx-title">系统提示是怎么拼出来的</span><span class="idx-hook">预算受限的分段组合,一次运行只拼一次以吃 prompt 缓存</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>二 · 交互与持久化</h2>
+<p class="sub">阻塞式 agent 怎么接进 TUI、会话怎么落盘与时间旅行</p>
+<ul class="idx-list">
+<li><a href="0006-tui-bridge.html"><span class="idx-num">06</span><span class="idx-body"><span class="idx-title">TUI:把流式 agent 接进 Elm 事件循环</span><span class="idx-hook">回调 → tea.Msg,权限/追问用 channel 会合</span></span></a></li>
+<li><a href="0007-session-persistence.html"><span class="idx-num">07</span><span class="idx-body"><span class="idx-title">会话持久化与时间旅行</span><span class="idx-hook">事件日志作真相 + 内容寻址快照,/rewind 原子回溯</span></span></a></li>
+<li><a href="0008-session-replay.html"><span class="idx-num">08</span><span class="idx-body"><span class="idx-title">会话回放:把事件日志重新塌缩成一条磁带</span><span class="idx-hook">RehydrateEvents 折叠最后一次压缩,决策与执行分离</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>三 · Provider 与流</h2>
+<p class="sub">一个接口喂饱各家模型、共享地基、流怎么被抽干、什么时候敢重发</p>
+<ul class="idx-list">
+<li><a href="0009-provider-adapter.html"><span class="idx-num">09</span><span class="idx-body"><span class="idx-title">Provider 适配层:一个接口喂饱 25+ 家模型</span><span class="idx-hook">封闭事件词表作防腐边界,双向翻译——最该复刻的一条边界</span></span></a></li>
+<li><a href="0010-providerio-shared-layer.html"><span class="idx-num">10</span><span class="idx-body"><span class="idx-title">providerio 共享层:所有适配器脚下的地基</span><span class="idx-hook">非幂等的 completion 绝不重放,只重试「服务端证明没收下」的错</span></span></a></li>
+<li><a href="0011-collect-stream.html"><span class="idx-num">11</span><span class="idx-body"><span class="idx-title">CollectStreamWithOptions:把事件流抽干成一次结果</span><span class="idx-hook">四个出口全走一个 flush 点,边累积边转发回调</span></span></a></li>
+<li><a href="0012-loop-retry-path.html"><span class="idx-num">12</span><span class="idx-body"><span class="idx-title">loop.go 的重试路径</span><span class="idx-hook">一条铁律:没吐出正文才敢把一整轮再发一遍</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>四 · 沙箱安全</h2>
+<p class="sub">放行/追问/拒绝怎么判、判完怎么把命令真正关进笼子</p>
+<ul class="idx-list">
+<li><a href="0013-sandbox-engine.html"><span class="idx-num">13</span><span class="idx-body"><span class="idx-title">沙箱引擎:一条有序判定链</span><span class="idx-hook">顺序即安全语义,allow grant 永远盖不过网络/毁灭性拦截</span></span></a></li>
+<li><a href="0014-sandbox-runner.html"><span class="idx-num">14</span><span class="idx-body"><span class="idx-title">从判定到笼子:命令怎么被原生沙箱包裹</span><span class="idx-hook">计划/执行分离,Wrapped 字段绝不撒谎;allowlist 靠实证生长</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>五 · 会话拓扑</h2>
+<p class="sub">一条会话怎么分叉、怎么挂子会话、子任务进度怎么回流</p>
+<ul class="idx-list">
+<li><a href="0015-session-fork-child.html"><span class="idx-num">15</span><span class="idx-body"><span class="idx-title">会话分叉 vs 子会话</span><span class="idx-hook">Fork 复制历史、Child 挂双向链接,事件溯源就是那张 join 表</span></span></a></li>
+<li><a href="0016-specialist-progress-reflow.html"><span class="idx-num">16</span><span class="idx-body"><span class="idx-title">specialist 进度回流</span><span class="idx-hook">一条实时管道 + 一条持久账本,喂同一张卡片</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>六 · 工具系统与扩展</h2>
+<p class="sub">工具怎么注册分发、外部能力怎么接进来、用户怎么注入可复用指令</p>
+<ul class="idx-list">
+<li><a href="0017-tool-registry-dispatch.html"><span class="idx-num">17</span><span class="idx-body"><span class="idx-title">工具注册与分发</span><span class="idx-hook">5 方法小接口 + 一排可选能力,穿一条唯一咽喉同时拿下可扩展与安全</span></span></a></li>
+<li><a href="0018-mcp-tool-adapter.html"><span class="idx-num">18</span><span class="idx-body"><span class="idx-title">MCP 接入:外部进程工具变注册表一等公民</span><span class="idx-hook">一个适配器抹平远程/本地,Safety 由宿主强加不容自评</span></span></a></li>
+<li><a href="0019-skill-system.html"><span class="idx-num">19</span><span class="idx-body"><span class="idx-title">Skill 系统:磁盘上一叠 SKILL.md</span><span class="idx-hook">做成只读工具由模型按需取用,不预灌进 prompt</span></span></a></li>
+<li><a href="0020-skill-vs-user-command.html"><span class="idx-num">20</span><span class="idx-body"><span class="idx-title">Skill vs 用户命令</span><span class="idx-hook">同是 markdown,模型按需取 vs 人敲了就展开,喂进循环的两端</span></span></a></li>
+</ul>
+</div>
+
+<div class="idx-group">
+<h2>附 · 官方架构图与时序图</h2>
+<p class="sub">直接从 Zero 仓库 <code>docs/</code> 搬来的流程图/序列图,配合正文一起看更直观</p>
+<ul class="idx-list">
+<li><a href="../diagrams/zero-cli-flow.html"><span class="idx-num">流程</span><span class="idx-body"><span class="idx-title">zero CLI 运行流程</span><span class="idx-hook">入口分派:一条命令怎么走到 TUI 或 exec</span></span></a></li>
+<li><a href="../diagrams/zero-tui-flow.html"><span class="idx-num">流程</span><span class="idx-body"><span class="idx-title">zero 交互式 TUI 流程</span><span class="idx-hook">配合第 06 课:agent 怎么接进 Bubble Tea 事件循环</span></span></a></li>
+<li><a href="../diagrams/zero-exec-flow.html"><span class="idx-num">流程</span><span class="idx-body"><span class="idx-title">zero exec 一次性执行流程</span><span class="idx-hook">非交互模式:一次性 prompt 怎么跑完就退出</span></span></a></li>
+<li><a href="../diagrams/zero-agent-loop-flow.html"><span class="idx-num">流程</span><span class="idx-body"><span class="idx-title">agent.Run 循环流程</span><span class="idx-hook">配合第 01 课:主循环的分支与终止条件全景</span></span></a></li>
+<li><a href="../diagrams/zero-agent-loop-sequence.html"><span class="idx-num">时序</span><span class="idx-body"><span class="idx-title">agent.Run 单轮时序</span><span class="idx-hook">配合第 01/11 课:一轮里各组件的调用先后</span></span></a></li>
+<li><a href="../diagrams/agent-loop-sequence.html"><span class="idx-num">时序</span><span class="idx-body"><span class="idx-title">Agent Loop 处理详细序列图</span><span class="idx-hook">配合第 02/17 课:工具调用穿过闸门与分发的全过程</span></span></a></li>
+<li><a href="../diagrams/tui-sequence.html"><span class="idx-num">时序</span><span class="idx-body"><span class="idx-title">TUI 交互时序(含排队输入)</span><span class="idx-hook">配合第 06 课:用户输入排队与 Msg 会合</span></span></a></li>
+<li><a href="../diagrams/tui-processing-sequence.html"><span class="idx-num">时序</span><span class="idx-body"><span class="idx-title">TUI 处理详细序列图</span><span class="idx-hook">配合第 06 课:回调 → tea.Msg 的完整往返</span></span></a></li>
+<li><a href="../diagrams/exec-oneshot-sequence.html"><span class="idx-num">时序</span><span class="idx-body"><span class="idx-title">exec 一次性 prompt 执行详细序列图</span><span class="idx-hook">配合第 08 课:非交互路径的组件时序</span></span></a></li>
+</ul>
+</div>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 想深入某一课、补一份参考文档(如术语表),或换个大块(swarm/多 agent 编排)都可以说一声。
+</div>
+
+<footer>Zero 架构课程 · 目录 · 基于 <code>github.com/Gitlawb/zero</code> 源码 · 共 20 课</footer>
+
+</body>
+</html>

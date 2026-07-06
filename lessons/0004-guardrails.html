@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第四课 — 护栏:让循环不至于失控</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第四课</p>
+<h1>护栏:循环对模型的「不信任」</h1>
+
+<p>
+第一课的循环有个 <code>maxTurns = 12</code> 的天花板 —— 那是最后的硬止损。但一个只靠天花板
+兜底的 agent 会很糟:模型可能连着 12 回合空转、或对同一个坏调用反复撞墙、或一直只调工具
+从不产出结论。护栏(<code>guardState</code>)就是循环用来<strong>提前</strong>识别这些失控
+模式的一组有界计数器。
+</p>
+
+<blockquote>
+对齐 mission:一个真实的 coding agent,一半复杂度不在「让它能干活」,而在「让它别乱干」。
+这一课解释 Zero 怎么把「模型可能不听话」这个前提,编码成具体的停止与提醒规则。
+</blockquote>
+
+<h2>核心洞察:循环假设模型会犯错</h2>
+<p>
+护栏状态挂在每次运行开头(<code>newGuardState</code>),在第一课循环的两个点被喂数据:
+每个回合后 <code>observeTurn</code>、每个工具结果后 <code>observeToolResult</code>。
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:353</a>
+它把失控分成两类处理:
+</p>
+<ul>
+<li><strong>硬停(halt):</strong> 情况无法靠继续解决 —— 直接结束这次运行。</li>
+<li><strong>软推(nudge):</strong> 情况也许能自我纠正 —— 注入<em>一次性</em>提醒消息,不停止。</li>
+</ul>
+
+<h2>硬停:两道熔断</h2>
+
+<h3>① 连续空回合 → 停</h3>
+<p>
+一个回合<strong>既无可见文本、又无工具调用</strong>就是「空回合」。连续
+<code>maxEmptyTurns = 3</code> 次就停止运行,以免在撞到 <code>maxTurns</code> 之前白烧回合。
+任何一次有产出的回合都会把计数器<strong>清零</strong>。
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:19</a>、
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:414</a>
+</p>
+
+<h3>② 同一错误重复失败 → 先提示,再停</h3>
+<p>
+这是最精妙的一道。<code>observeToolResult</code> 按<strong>工具名 + 错误签名</strong>记录
+连续失败次数(<code>errorSignature</code> 把错误输出归一成一个签名,
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:252</a>)。它是一个升级阶梯:
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:381</a>
+</p>
+<ul>
+<li>失败到第 <strong>2</strong> 次(<code>toolFailureHintAt</code>):注入一次性纠正提示 —— 把该工具的
+<em>schema + 精确错误</em>喂回去,让模型自己改。</li>
+<li>失败到第 <strong>4</strong> 次(<code>toolFailureStopAt</code>):halt。任何模型(弱或强)都不该
+在一个坏调用上循环。</li>
+<li><strong>一次成功就清空该工具的失败连击。</strong></li>
+</ul>
+<div class="callout">
+<span class="label">为什么要「同一错误」</span>
+只有<em>相同签名</em>的连续失败才累加。第二课讲过:重复失败提示只对「参数/格式写错」这种
+可重试错误有意义;换个错误说明模型在尝试新东西,不该被当成撞墙。这也呼应第一课
+<code>isRetriableToolError</code> 的门槛 —— 权限拒绝、沙箱阻断这类策略性失败不驱动它,因为
+「照 schema 重写」根本修不了它们。
+</div>
+
+<h2>软推:四类一次性提醒(不停止)</h2>
+<table style="border-collapse:collapse;width:100%;font-size:0.9rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">触发</th><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">推什么</th><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">阈值</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">只调工具、连着不产文本</td><td style="padding:.4rem .6rem">提醒它「先把已知的综合成结论」</td><td style="padding:.4rem .6rem"><code>6</code> 回合</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">多步任务却没调 <code>update_plan</code></td><td style="padding:.4rem .6rem">提醒它建计划(not-called)</td><td style="padding:.4rem .6rem">到第 <code>3</code> 回合</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">调了计划但很久没更新</td><td style="padding:.4rem .6rem">提醒它更新计划(stale)</td><td style="padding:.4rem .6rem"><code>10</code> 次调用未更新</td></tr>
+<tr><td style="padding:.4rem .6rem">停下但工作未完(headless 门)</td><td style="padding:.4rem .6rem">continue-nudge:继续或标记完成</td><td style="padding:.4rem .6rem">最多 <code>3</code> 次</td></tr>
+</table>
+<p>
+关键:每条提醒都是<strong>一次性</strong>的(<code>...ReminderSent</code> 标志),或<em>每个区间</em>
+一次(计划更新会开启新的 stale 区间并重置标志)。这避免了「每回合都唠叨同一句」的噪音。
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:475</a>、
+<a class="cite" href="../../zero/internal/agent/guardrails.go">guardrails.go:486</a>
+</p>
+
+<h2>三个反复出现的设计手法</h2>
+<ul>
+<li><strong>进展即重置。</strong> 好回合清零 <code>emptyTurns</code>;工具成功清空失败连击;计划更新
+开启新区间。计数器度量的是「连续的坏」,不是「累计的坏」。</li>
+<li><strong>先提示,后熔断。</strong> 重复失败在第 2 次给药方、第 4 次才停 —— 给模型自愈的机会,
+但机会有限。</li>
+<li><strong>一次性,不唠叨。</strong> 每个提醒带 sent 标志。护栏要像安静的护栏,不是碎嘴的副驾。</li>
+</ul>
+
+<div class="callout warn">
+<span class="label">和天花板的关系</span>
+<code>maxTurns</code> 是「不管发生什么都停」的粗止损;护栏是「识别出<em>具体</em>失控模式就早停或早提醒」
+的细止损。前者保证有限,后者保证<em>高效地</em>有限 —— 不浪费到天花板才发现早就在空转。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">连续多少个「既无文本又无工具调用」的空回合会 halt?</p>
+  <button class="opt">1 个</button>
+  <button class="opt">2 个</button>
+  <button class="opt">3 个(maxEmptyTurns)</button>
+  <button class="opt">12 个(等于 maxTurns)</button>
+  <div class="fb"
+    data-correct="对 —— maxEmptyTurns=3(guardrails.go:19),且任一有产出的回合会清零计数。"
+    data-wrong="是 3(maxEmptyTurns,guardrails.go:19);有产出的回合会重置它。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">同一工具用同一错误连续失败,循环怎么处理?</p>
+  <button class="opt">第 2 次给 schema+错误的提示,第 4 次 halt</button>
+  <button class="opt">第 1 次就立即 halt</button>
+  <button class="opt">一直重试直到撞 maxTurns</button>
+  <button class="opt">静默丢弃该工具的所有后续调用</button>
+  <div class="fb"
+    data-correct="对 —— 升级阶梯:hint@2、stop@4(guardrails.go:381),一次成功清空连击。"
+    data-wrong="是先提示(第2次)后熔断(第4次)的阶梯(guardrails.go:381)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么只有「相同错误签名」的失败才累加计数?</p>
+  <button class="opt">为了节省内存</button>
+  <button class="opt">换个错误说明在尝试新东西,不算撞墙;且策略性失败重写 schema 也修不了</button>
+  <button class="opt">因为 provider 要求错误必须唯一</button>
+  <button class="opt">为了让 TUI 只显示一种错误</button>
+  <div class="fb"
+    data-correct="对 —— 只有可重试的同一错误反复出现才是『撞墙』;呼应 isRetriableToolError 的门槛(guardrails.go:252)。"
+    data-wrong="不同错误=在尝试新路径,不该罚;权限/沙箱这类策略失败重写也没用(guardrails.go:252)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +14  ../zero/internal/agent/guardrails.go   # 所有阈值常量一目了然
+less +381 ../zero/internal/agent/guardrails.go   # observeToolResult 升级阶梯
+less +414 ../zero/internal/agent/guardrails.go   # observeTurn 空回合/tool-only 计数</code></pre>
+<p>
+读的时候先只看顶部那组 <code>const</code>(<code>:14</code>)—— 每个数字就是一条策略。然后看两个
+<code>observe*</code> 方法怎么在「进展时清零、连续坏时累加」。护栏的全部智慧就在这两件事里。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>errorSignature</code> 到底怎么把错误归一成签名的?」、
+「headless 的 completion gate(<code>RequireCompletionSignal</code>)和这些护栏怎么协作?」,
+或者「<code>endsWithContinuationCue</code> 怎么判断模型『话说到一半停了』?」
+</div>
+
+<div class="nav">
+  <span>← 第三课:上下文压缩</span>
+  <span>下一课:第五课 —— 系统提示是怎么拼出来的(<code>system_prompt.go</code>)→</span>
+</div>
+
+<footer>Zero 架构课程 · 第四课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

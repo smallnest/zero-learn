@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十三课 — 沙箱引擎:一条有序判定链,决定放行/追问/拒绝</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十三课</p>
+<h1>沙箱:策略 + 授权 + 检查,合成一个 Allow/Prompt/Deny</h1>
+
+<p>
+第二课的 <code>executeToolCall</code> 有一道关卡问沙箱:「这个工具调用能跑吗?」这一课就拆开回答那句话的引擎。
+它的全部产出是一个 <code>Decision{Action: Allow | Prompt | Deny}</code> —— 放行、追问用户、或直接拒。
+难点不在任何单条规则,而在<strong>这些规则以什么顺序叠加</strong>:一条<em>严格有序</em>的判定链
+<code>Engine.Evaluate</code>
+<a class="cite" href="../../zero/internal/sandbox/engine.go">engine.go:277</a>。
+</p>
+
+<blockquote>
+对齐 mission:一个自动跑命令的 coding agent,最危险的一步就是「执行」。既不能每条命令都烦用户点确认(那就退化成手工),
+也不能默默放行一条 <code>rm -rf</code>。这一课的功夫,是把「什么时候敢自动放行、什么时候必须追问、什么时候直接拒」
+编码成一条<strong>顺序即语义</strong>的链 —— 顺序错了,安全就漏了。
+</blockquote>
+
+<h2>核心形状:短路优先,越危险的判断越靠前</h2>
+<p>
+<code>Evaluate</code> 从上到下一路 <code>return</code>,谁先命中谁说了算。顺序是刻意设计的 —— <strong>拒绝类的判断必须排在放行类之前</strong>,
+否则一条本该拒的请求会被前面的「放行」提前接走。链条骨架:
+</p>
+<table style="border-collapse:collapse;width:100%;font-size:0.85rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">顺位</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">判断</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">结果</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">1</td><td style="padding:.3rem .5rem">ctx 已取消 <a class="cite" href="../../zero/internal/sandbox/engine.go">:281</a></td><td style="padding:.3rem .5rem">Deny</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">2</td><td style="padding:.3rem .5rem">engine 为 nil / ModeDisabled <a class="cite" href="../../zero/internal/sandbox/engine.go">:285,:299</a></td><td style="padding:.3rem .5rem">Allow(沙箱关)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">3</td><td style="padding:.3rem .5rem">Permission==Deny <a class="cite" href="../../zero/internal/sandbox/engine.go">:302</a></td><td style="padding:.3rem .5rem">Deny</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">4</td><td style="padding:.3rem .5rem">持久化 <strong>deny</strong> 授权命中 <a class="cite" href="../../zero/internal/sandbox/engine.go">:312</a></td><td style="padding:.3rem .5rem">Deny</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">5</td><td style="padding:.3rem .5rem">路径检查(工作区边界 / Deny·Allow 路径表)<a class="cite" href="../../zero/internal/sandbox/engine.go">:334,:338</a></td><td style="padding:.3rem .5rem">Deny 或攒起可追问块</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">6</td><td style="padding:.3rem .5rem">网络拒绝 <a class="cite" href="../../zero/internal/sandbox/engine.go">:350</a></td><td style="padding:.3rem .5rem">shell→Prompt,否则 Deny</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">7</td><td style="padding:.3rem .5rem">破坏性 shell 命令 <a class="cite" href="../../zero/internal/sandbox/engine.go">:356</a></td><td style="padding:.3rem .5rem">Prompt / Deny</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">8</td><td style="padding:.3rem .5rem">持久化 allow → 会话 allow <a class="cite" href="../../zero/internal/sandbox/engine.go">:374,:383</a></td><td style="padding:.3rem .5rem">Allow</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">9</td><td style="padding:.3rem .5rem">攒起的可追问路径块 <a class="cite" href="../../zero/internal/sandbox/engine.go">:392</a></td><td style="padding:.3rem .5rem">Prompt</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">10</td><td style="padding:.3rem .5rem">工作区内写自动放行 <a class="cite" href="../../zero/internal/sandbox/engine.go">:398</a></td><td style="padding:.3rem .5rem">Allow</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">11</td><td style="padding:.3rem .5rem"><strong>原生沙箱激活 → shell 自动放行</strong> <a class="cite" href="../../zero/internal/sandbox/engine.go">:405</a></td><td style="padding:.3rem .5rem">Allow</td></tr>
+<tr><td style="padding:.3rem .5rem">12</td><td style="padding:.3rem .5rem">兜底 <a class="cite" href="../../zero/internal/sandbox/engine.go">:411</a></td><td style="padding:.3rem .5rem">Prompt</td></tr>
+</table>
+
+<div class="callout">
+<span class="label">为什么 deny 授权在检查<em>之前</em>、allow 授权在检查<em>之后</em></span>
+持久化 <strong>deny</strong> 在第 4 位就短路(<a class="cite" href="../../zero/internal/sandbox/engine.go">:312</a>):用户说过「永远别碰这个」,那连路径、网络检查都不必跑,直接拒。
+但持久化/会话 <strong>allow</strong> 却压到第 8 位(<a class="cite" href="../../zero/internal/sandbox/engine.go">:374</a>)—— 在<em>网络、破坏性、路径</em>检查<strong>之后</strong>。
+含义很硬:一条「允许授权」<em>绝不能</em>盖过网络封禁或破坏性拦截。用户授权跑某工具 ≠ 授权它连外网或跑 <code>rm -rf</code>。
+拒绝能被授权提前豁免,放行不能提前豁免安全检查 —— 这就是顺序编码的安全语义。
+</div>
+
+<h2>顺序即正确性:一处「先查 ctx」的呼应</h2>
+<p>
+和第十二课那条「恢复逻辑先查 <code>ctx.Err()</code>」一模一样的纪律,在这里是判定链的<strong>第一步</strong>
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:281</a>:取消优先于一切业务判断。
+一个在关停中的 agent,不该还在纠结「这条命令要不要追问」—— 先认取消,直接 deny 收场。
+</p>
+
+<h2>最精妙的一条:原生沙箱激活,shell 才敢自动放行</h2>
+<p>
+第 11 位是整条链的点睛之笔
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:405</a>:一条<em>普通</em> shell 命令(网络/破坏性/路径都已在前面放过)
+到底自动放行、还是追问用户?答案取决于 <code>shellSandboxActive</code>
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:223</a>:
+</p>
+<pre><code>if !(backend.Available && backend.Executable != "" &&
+     backend.CommandWrapping && backend.NativeIsolation) {
+    return false          // ← engine.go:231:四个条件缺一不可
+}</code></pre>
+<div class="callout">
+<span class="label">安全边界从「问用户」换成了「操作系统」</span>
+逻辑是:如果有一个<em>真实的 OS 级隔离</em>(Linux 的 landlock/seccomp、macOS 的 sandbox-exec、Windows ACL)包着这条命令,
+那命令就算乱来,也被内核关在笼子里 —— 此时每条都追问用户纯属噪音,可以自动放行。
+反过来,后端<em>不可用</em>(没装、没初始化),就没有笼子,只能退回「每条命令问一次」的审批底线
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:404</a>。
+<strong>安全边界要么是用户的点击、要么是内核的隔离 —— 二者必居其一,绝不落空。</strong>
+</div>
+<p>
+Windows 上有个诚实的降级
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:240</a>:命令要等 <code>zero sandbox setup</code> 写下标记后才真正被包裹;
+标记没写时,引擎<strong>拒绝</strong>把它当「已沙箱化」自动放行,而是 fall through 去追问。
+注释点破了原因:否则引擎会把一条<em>其实在裸奔</em>的命令当成「有沙箱保护」放行,直接击穿上面那条不变量。
+引擎的判断必须与运行时<em>真实</em>发生的包裹严格镜像 —— 声称的安全和实际的安全必须一致。
+</p>
+
+<h2>不重复策略:Precheck 复用 Evaluate</h2>
+<p>
+想在执行<em>前</em>先问一句「这会被拦吗?」的调用方(批量确认、预检),不另写一套判断,而是
+<code>Precheck</code>
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:252</a> 直接调 <code>Evaluate</code> 再把 deny 抽成 <code>Block</code>
+<a class="cite" href="../../zero/internal/sandbox/engine.go">:262</a>。
+一份策略,一个真相来源 —— 预检和真判定永不漂移。这和第十一课「流式与非流式共用一次遍历」是同一种「单一实现」的洁癖。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">为什么持久化 deny 授权短路在前,而 allow 授权排在检查之后?</p>
+  <button class="opt">因为查询拒绝授权的存储开销明显小于查询允许授权</button>
+  <button class="opt">因为拒绝授权的数量通常远少于允许授权便于提前命中</button>
+  <button class="opt">允许授权绝不能盖过网络与破坏性检查,拒绝却可提前短路</button>
+  <button class="opt">因为允许授权必须等待路径检查填充它所需要的字段</button>
+  <div class="fb"
+    data-correct="对 —— 授权跑某工具≠授权它连外网或跑 rm -rf;故 allow 压在网络/破坏性/路径检查之后,deny 可提前短路(engine.go:374)。"
+    data-wrong="allow 授权不能豁免安全检查,故排在网络/破坏性/路径之后;deny 是硬拒可提前短路(engine.go:374)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">一条普通 shell 命令什么时候被自动放行而不再追问用户?</p>
+  <button class="opt">当一个可用的原生 OS 级隔离后端正把这条命令真实包裹起来</button>
+  <button class="opt">当这条命令过去曾被用户在本次会话里手动确认放行过一次</button>
+  <button class="opt">当命令文本经过静态分析后未匹配任何已知的危险模式表</button>
+  <button class="opt">当当前策略处于宽松模式且该命令并未触及任何受保护路径</button>
+  <div class="fb"
+    data-correct="对 —— shellSandboxActive 要求 backend 可用+可执行+包裹+原生隔离四者齐备;有内核笼子才自动放行,否则退回逐条追问(engine.go:405)。"
+    data-wrong="要 shellSandboxActive 为真(后端可用/可执行/包裹/原生隔离齐备);有真实 OS 隔离才自动放行(engine.go:405)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">Windows 上标记未写时,引擎为何拒绝把 shell 命令当已沙箱化放行?</p>
+  <button class="opt">因为写入标记这个动作本身需要更高的管理员权限才可完成</button>
+  <button class="opt">否则会把实际在裸奔的命令当成有保护放行,击穿安全不变量</button>
+  <button class="opt">因为标记文件缺失会导致命令包裹器无法定位到可执行路径</button>
+  <button class="opt">因为未初始化的后端在该平台上完全无法启动任何隔离进程</button>
+  <div class="fb"
+    data-correct="对 —— 标记没写前命令实际不被包裹;若仍当『已沙箱化』放行,就把裸奔命令当有保护,破坏『边界要么点击要么内核』的不变量(engine.go:240)。"
+    data-wrong="标记未写时命令实际裸奔;引擎判断必须镜像真实包裹,否则把无保护命令当有保护放行(engine.go:240)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +277 ../zero/internal/sandbox/engine.go   # Evaluate:严格有序的判定链(全课核心)
+less +312 ../zero/internal/sandbox/engine.go   # 持久化 deny 短路 vs :374 allow 后置
+less +223 ../zero/internal/sandbox/engine.go   # shellSandboxActive:四条件齐备才算激活
+less +240 ../zero/internal/sandbox/engine.go   # Windows 标记未写→降级追问
+less +252 ../zero/internal/sandbox/engine.go   # Precheck 复用 Evaluate:一份策略不重复</code></pre>
+<p>
+读的顺序:先通读 <code>Evaluate</code> 从上到下的每个 <code>return</code>,记住「拒在前、放在后」这条脊椎。
+再把第 4 位的持久化 deny 和第 8 位的 allow 对读 —— 体会「授权能豁免拒绝、不能豁免检查」。
+最后啃 <code>shellSandboxActive</code> 那四个 <code>&&</code> 条件和 Windows 降级注释 —— 那是「安全边界要么点击要么内核,绝不落空」的全部落地。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 沙箱这一包很大,这课只讲了「判定」。适合现在追问:
+「判定通过后,<code>runner.go</code> 怎么用 landlock/seccomp/sandbox-exec <em>真正</em>把命令关进笼子?」、
+「<code>Classify</code>(<code>risk.go</code>)怎么认出一条命令是破坏性/触网的?」,
+或者「授权是怎么持久化、又怎么按 scope 匹配的(<code>grants.go</code>/<code>grant_scope.go</code>)?」
+</div>
+
+<div class="nav">
+  <span>← 第十二课:loop.go 的重试路径</span>
+  <span>执行前的「判定层」已覆盖。下一步可选:runner 原生隔离 / 风险分类 / 授权持久化与 scope 匹配</span>
+</div>
+
+<footer>Zero 架构课程 · 第十三课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

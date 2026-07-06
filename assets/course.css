@@ -1,0 +1,168 @@
+/* course.css — shared stylesheet for the Zero Architecture course.
+   Tufte-inspired: readable serif body, generous margins, restrained color. */
+
+:root {
+  --ink: #1a1a1a;
+  --paper: #fffff8;
+  --muted: #6b6b63;
+  --rule: #d8d8cf;
+  --accent: #34607a;
+  --code-bg: #f4f4ee;
+  --warn: #8a5a00;
+  --ok: #2f6b3a;
+  --maxw: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e8e8e0; --paper: #1b1b19; --muted: #9a9a90;
+    --rule: #3a3a35; --accent: #7fb0cc; --code-bg: #26261f;
+    --warn: #d1a24a; --ok: #7fc48b;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { font-size: 18px; }
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  line-height: 1.55;
+  max-width: var(--maxw);
+  margin: 3rem auto 6rem;
+  padding: 0 1.4rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+.eyebrow {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.4rem;
+}
+
+h1 { font-size: 2rem; line-height: 1.15; margin: 0 0 1.2rem; font-weight: 600; }
+h2 {
+  font-size: 1.28rem; margin: 2.4rem 0 0.6rem; font-weight: 600;
+  padding-bottom: 0.2rem; border-bottom: 1px solid var(--rule);
+}
+h3 { font-size: 1.05rem; margin: 1.6rem 0 0.4rem; font-weight: 600; }
+
+p, li { font-size: 1.02rem; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+code {
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  font-size: 0.86em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+blockquote {
+  margin: 1.2rem 0;
+  padding: 0.4rem 0 0.4rem 1.1rem;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* citation chip → link to a real file:line in the repo */
+.cite {
+  font-family: ui-monospace, monospace;
+  font-size: 0.74rem;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 0.05em 0.55em;
+  color: var(--muted);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.cite:hover { border-color: var(--accent); color: var(--accent); }
+
+.callout {
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+  margin: 1.4rem 0;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.callout.warn { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.callout .label {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); display: block; margin-bottom: 0.3rem;
+}
+
+/* quiz widget (shared component: assets/quiz.js) */
+.quiz { margin: 1.6rem 0; }
+.quiz .q { font-weight: 600; margin-bottom: 0.6rem; }
+.quiz .opt {
+  display: block; width: 100%; text-align: left;
+  font: inherit; font-size: 0.95rem;
+  background: var(--paper); color: var(--ink);
+  border: 1px solid var(--rule); border-radius: 6px;
+  padding: 0.55rem 0.8rem; margin: 0.35rem 0; cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.quiz .opt:hover { border-color: var(--accent); }
+.quiz .opt.correct { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.quiz .opt.wrong { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.quiz .fb { margin-top: 0.5rem; font-size: 0.9rem; color: var(--muted); min-height: 1.2rem; }
+
+.nav {
+  margin-top: 3.5rem; padding-top: 1rem; border-top: 1px solid var(--rule);
+  font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.85rem;
+  display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+}
+
+.ask {
+  margin-top: 2.5rem; font-size: 0.9rem; color: var(--muted);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; }
+
+/* index page (assets shared): grouped lesson cards */
+.idx-group { margin: 2.2rem 0 0; }
+.idx-group > h2 { margin-bottom: 0.9rem; }
+.idx-group > .sub {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.8rem; color: var(--muted); margin: -0.4rem 0 1rem;
+}
+.idx-list { list-style: none; margin: 0; padding: 0; }
+.idx-list li { margin: 0 0 0.55rem; }
+.idx-list a {
+  display: flex; align-items: baseline; gap: 0.7rem;
+  text-decoration: none; color: var(--ink);
+  border: 1px solid var(--rule); border-radius: 7px;
+  padding: 0.6rem 0.85rem;
+  transition: border-color .12s, background .12s;
+}
+.idx-list a:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.idx-num {
+  font-family: ui-monospace, monospace; font-size: 0.78rem;
+  color: var(--accent); font-weight: 600; min-width: 2.2rem; flex-shrink: 0;
+}
+.idx-body { display: flex; flex-direction: column; gap: 0.15rem; }
+.idx-title { font-size: 0.98rem; font-weight: 600; }
+.idx-hook {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.8rem; color: var(--muted); line-height: 1.4;
+}

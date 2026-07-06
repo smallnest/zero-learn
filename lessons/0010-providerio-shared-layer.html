@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十课 — providerio 共享层:所有适配器脚下的同一块地基</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十课</p>
+<h1>providerio:适配器<em>不</em>各写一遍的那些事</h1>
+
+<p>
+第九课讲每个 <code>internal/providers/&lt;家&gt;/</code> 是一个防腐层 —— 装的是各家<strong>不一样</strong>的怪癖。
+这一课翻到硬币另一面:<code>internal/providers/providerio/</code> 装的是所有适配器<strong>完全一样</strong>的那部分 ——
+重试、鉴权、HTTP 客户端、SSE 解析、脱敏。Anthropic / Gemini / OpenAI / Codex 的 <code>StreamCompletion</code>
+里,凡是「发一个 POST、读一条 SSE 流、把密钥擦掉」的动作,走的都是这一个包。
+</p>
+
+<blockquote>
+对齐 mission:防腐层保证「加一家 provider 只写一个翻译器」,但如果重试、超时、脱敏也让每家各写一遍,
+就会出现<em>各家行为不一致</em>的 bug(注释里点名:以前只有 OpenAI 会重试,Anthropic/Gemini 遇到 429 直接
+把首个失败抛出去)。把这些<strong>横切策略</strong>抽进一个共享层,是「一致性」的来源。
+</blockquote>
+
+<h2>贯穿全课的一条铁律:completion POST 不可重放</h2>
+<p>
+这一个原则解释了这个包里几乎每一个决定。一次 completion 请求是<strong>非幂等</strong>的:请求一旦到达服务器,
+就可能已经在生成一段<em>要计费</em>的补全。所以「失败了要不要重试」永远先问一句:<em>这次失败,能证明服务器
+根本没接活吗?</em>
+</p>
+
+<h2>retry.go:只重试「服务器明确没接活」的状态</h2>
+<p>
+<code>SendWithRetry</code>
+<a class="cite" href="../../zero/internal/providers/providerio/retry.go">retry.go:43</a>
+是所有 provider 共享的唯一重试策略。它<strong>只</strong>重试三个状态 ——
+<code>ShouldRetryStatus</code>
+<a class="cite" href="../../zero/internal/providers/providerio/retry.go">retry.go:108</a>:
+</p>
+<pre><code>429 Too Many Requests   // 被限流:服务器明确拒收
+503 Service Unavailable  // 服务不可用:明确拒收
+529 (Anthropic overloaded) // 过载:明确拒收</code></pre>
+<div class="callout">
+<span class="label">为什么别的失败一律不重</span>
+<strong>其他 5xx(500/502/504)不重</strong>:一个 504 网关超时可能发生在上游<em>已经产出计费补全之后</em>,
+重放就是重复计费。<strong>传输层错误(网络断/超时)也不重</strong>
+<a class="cite" href="../../zero/internal/providers/providerio/retry.go">retry.go:65</a>:POST 的连接失败<em>不</em>代表
+服务器没收到 —— 可能请求已到、补全正在生成,只是响应回不来了。唯有 429/503/529 <strong>能证明</strong>请求没被受理,
+才安全可重。流一旦开始(200 之后)也永不重发。
+</div>
+<p>
+退避 <code>Backoff</code>
+<a class="cite" href="../../zero/internal/providers/providerio/retry.go">retry.go:115</a> 默认 <code>attempt×400ms</code>,
+但服务器给了 <code>Retry-After</code> 就<em>听它的</em>(<code>RetryAfter</code> 解析秒数或 HTTP 日期,
+<a class="cite" href="../../zero/internal/providers/providerio/retry.go">retry.go:136</a>),
+且整体<strong>封顶 30s</strong>(<code>maxBackoff</code>)—— 防止一个恶意/离谱的 <code>Retry-After</code> 把 agent 卡上几分钟。
+退避途中 <code>ctx</code> 被取消能立刻脱身。
+</p>
+
+<h2>auth.go:401 也能安全重试一次 —— 同一条铁律</h2>
+<p>
+<code>SendWithAuthRetry</code>
+<a class="cite" href="../../zero/internal/providers/providerio/auth.go">auth.go:27</a>
+包在 <code>SendWithRetry</code> 外面,多管一件事:OAuth 令牌可能过期。它在收到 <strong>401</strong> 时<strong>强制刷新令牌、
+重试恰好一次</strong>
+<a class="cite" href="../../zero/internal/providers/providerio/auth.go">auth.go:63</a>。
+为什么 401 可重?因为 401 意味着服务器<em>拒绝了请求、没有处理补全</em> —— 和 429/503 是同一个「没接活 → 重放安全」的保证。
+</p>
+<div class="callout">
+<span class="label">两处考究的安全细节</span>
+① <strong>先解析鉴权、再派发</strong>
+<a class="cite" href="../../zero/internal/providers/providerio/auth.go">auth.go:40</a>:如果把 resolver 放进请求回调里,
+一旦它报错,<code>SendWithRetry</code> 可能已经把一个<em>没带鉴权头</em>的请求发出去了(泄漏了路径/请求体)。所以令牌在
+发请求<em>之前</em>拿到,错误就直接返回。② <strong>两种鉴权绝不同时发</strong>:<code>withBearer</code>
+<a class="cite" href="../../zero/internal/providers/providerio/auth.go">auth.go:75</a> 在用 OAuth 时把
+<code>APIKey</code> 清空,保证 Authorization 头里不会既有 bearer 又有 key。
+</div>
+
+<h2>headers.go:一张表统一「鉴权头怎么拼」</h2>
+<p>
+<code>AuthHeaders</code>
+<a class="cite" href="../../zero/internal/providers/providerio/headers.go">headers.go:8</a>
+把各家五花八门的鉴权方式收进一个结构,<code>ApplyAuthHeaders</code>
+<a class="cite" href="../../zero/internal/providers/providerio/headers.go">headers.go:18</a> 按统一优先级拼头:
+自定义头覆盖默认头;有现成 <code>AuthHeaderValue</code>(OAuth)就直接用,否则用 API key + scheme 拼
+(<code>Bearer &lt;key&gt;</code>);scheme 为 <code>none</code>/<code>raw</code> 时裸发 key(有些自建端点要的就是裸 key)。
+Anthropic 的 <code>x-api-key</code>、OpenAI 的 <code>Authorization: Bearer</code>、某端点的自定义头 —— 全靠填这张表表达,
+而不是各写一段拼头逻辑。
+</p>
+
+<h2>providerio.go:共享的 HTTP 客户端与 SSE 解析</h2>
+
+<h3>① 一个「抗僵尸连接」的进程级客户端</h3>
+<p>
+<code>sharedHTTPClient</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:161</a>
+是所有没自带 client 的 provider 共用的那一个,专门调优来治一类挂死:Go 的连接池会复用 keep-alive 连接,
+而复用到一条<em>服务器/NAT 已经悄悄丢弃</em>的连接时,因为是 POST(非幂等),Go <strong>不会</strong>自动换新连接重发 ——
+于是永久等一个永远不来的响应。三个旋钮:
+</p>
+<ul>
+<li><strong><code>ResponseHeaderTimeout = 120s</code></strong>:限定「发完请求 → 收到首个响应头」的间隔,让复用到的死连接<em>快速失败</em>然后重拨。它<em>不</em>限制 200 之后的流式,所以慢首字/长推理不受影响。</li>
+<li><strong><code>IdleConnTimeout = 30s</code></strong>:让跨越停顿而变空闲的连接被关掉重拨,而非陈旧后复用。</li>
+<li><strong><code>DisableKeepAlives = (GOOS == "darwin")</code></strong>:只在 macOS 上彻底关池化。因为还有一类「没死但严重降速」的复用连接,从流内部无法与「后端本来就慢」区分,唯一可靠的修法就是在这个唯一复现过该 bug 的平台上把池化整个拿掉。每请求一次 TCP+TLS 握手只多几十毫秒,远比几分钟的挂死划算。</li>
+</ul>
+<div class="callout">
+<span class="label">这是一个 provider 无关的 bug</span>
+注释点明:因为大家共享<em>同一个</em>默认 transport,这个挂死在 chatgpt 和 ollama 上<strong>都</strong>复现了。
+把修法放在共享层 = 一次修好、全家受益。这正是共享层存在的意义。
+</div>
+
+<h3>② 双看门狗:idle vs content-stall</h3>
+<p>
+<code>ScanSSEDataWithContext</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:256</a>
+在阻塞式扫 SSE 的同时,用两个计时器守着流。区别很微妙:
+</p>
+<ul>
+<li><strong>idle 看门狗</strong>(默认 5 分钟,<code>DefaultStreamIdleTimeout</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:56</a>):只在<em>真正沉默</em>时触发。SSE 的 keep-alive 注释行(如 OpenRouter 的 <code>: OPENROUTER PROCESSING</code>)<strong>会重置</strong>它 —— 一个还在心跳的上游不算「死」。</li>
+<li><strong>content-stall 看门狗</strong>(idle 的 1.2×,<code>ContentStallTimeout</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:68</a>):只被<em>真实数据行</em>重置,keep-alive <strong>不</strong>重置它。治的是「一直心跳、却永不产出」的上游(chatgpt/gpt-5.x、ollama 推理模型上观察到)—— 光靠 idle 看门狗永远不会触发,agent 就无限挂着。</li>
+</ul>
+<p>
+两个看门狗任一触发,都调 <code>cancel()</code> 掐断在途请求(唤醒被 read 阻塞的读 goroutine),返回
+<code>ErrStreamIdle</code> / <code>ErrStreamStalled</code> 两种可区分的错误
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:340</a>。
+即便 <code>idleTimeout≤0</code>(看门狗关掉),扫描 goroutine + select 循环<em>照样跑</em>,好让 <code>ctx</code> 取消<strong>永远</strong>被尊重。
+</p>
+
+<h2>③ 脱敏是共享层的边界职责</h2>
+<p>
+<code>ClassifiedError</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:382</a>
+把上游 HTTP 错误归一化成可操作的话术(401/403 → 「跑 <code>zero auth</code>」),<em>每一条</em>都先过
+<code>Redact</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:423</a>
+擦掉密钥 —— 已知的 API key 直接替换,<code>Bearer</code> 后面<em>形似令牌</em>的词才擦(<code>looksLikeToken</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:411</a>),
+免得把上游帮助文本里的「Bearer authentication」也误伤。这和第二课工具结果在 registry 边界擦密钥、
+第八课摘要 prompt 过 <code>RedactString</code> 是<strong>同一条纪律</strong>:密钥绝不流进错误消息、日志或发回 provider。
+</p>
+<p>
+还有一个体贴的归一化:<code>UpstreamUnreachable</code>
+<a class="cite" href="../../zero/internal/providers/providerio/providerio.go">providerio.go:463</a>
+识别「本地 Ollama 代理云模型但连不上云端」这类<em>连通性</em>失败(502 + TLS handshake timeout + 具体 host),
+把晦涩的 Go 传输错误重写成「请求根本没到模型 —— 是模型服务器到它上游的网络故障」,并指明去查 DNS/代理/VPN。
+</p>
+
+<div class="callout warn">
+<span class="label">第九、十课合起来才是完整的 provider 层</span>
+<strong>第九课</strong>:防腐层 —— 每家<em>不同</em>的翻译逻辑,关在各自目录里。<strong>本课</strong>:共享层 ——
+每家<em>相同</em>的横切策略(重试/鉴权/HTTP/SSE/脱敏),抽进 <code>providerio</code>。加一家新 provider:
+你写那个「不同」的翻译器,然后<em>调用</em>这些「相同」的共享函数 —— 于是新 provider 天生就有了一致的
+重试语义、抗挂死客户端、超时看门狗和密钥脱敏,<strong>一行都不用重写</strong>。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">为什么 <code>SendWithRetry</code> 重试 429/503 却不重试 504?</p>
+  <button class="opt">因为 504 属于客户端错误,重试没有任何意义可言</button>
+  <button class="opt">因为 429 的退避时间比 504 短很多所以划算</button>
+  <button class="opt">429/503 证明服务器没接活可安全重放,504 可能已产出计费补全</button>
+  <button class="opt">因为标准明确规定只有 429 和 503 允许被重试</button>
+  <div class="fb"
+    data-correct="对 —— completion POST 非幂等;唯 429/503/529 能证明请求未被受理,重放不重复计费(retry.go:108)。"
+    data-wrong="因为 completion POST 非幂等:429/503/529 证明未接活可重放,504 可能已产出计费补全(retry.go:108)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">收到 401 时,<code>SendWithAuthRetry</code> 为什么敢重试一次?</p>
+  <button class="opt">401 表示请求被拒未处理补全,与 429 同属重放安全的一类</button>
+  <button class="opt">401 通常是网络抖动引起的,再试一次基本都会好</button>
+  <button class="opt">因为刷新令牌这个操作本身就自带幂等的保证机制</button>
+  <button class="opt">因为服务器要求客户端必须在收到后立即重发请求</button>
+  <div class="fb"
+    data-correct="对 —— 401=服务器拒绝、未处理补全,和 429/503『没接活→重放安全』同理,故强制刷新令牌重试一次(auth.go:63)。"
+    data-wrong="401 意味着请求被拒、未处理补全,与 429/503 同属『重放安全』,故刷新令牌后可安全重试一次(auth.go:63)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">SSE keep-alive 心跳行对两个看门狗分别有什么作用?</p>
+  <button class="opt">同时重置两个看门狗,因为心跳证明连接完全健康正常</button>
+  <button class="opt">重置 idle 看门狗但不重置 content 看门狗,故能抓住只心跳不产出</button>
+  <button class="opt">两个看门狗都不重置,心跳只用于统计连接的存活时间</button>
+  <button class="opt">只重置 content 看门狗,让持续心跳的连接永远不被判超时</button>
+  <div class="fb"
+    data-correct="对 —— 心跳重置 idle(上游没死),但不重置 content;故『一直心跳却不产出』会被 content 看门狗抓住(providerio.go:256)。"
+    data-wrong="心跳重置 idle(证明上游还活着)但不重置 content 看门狗,于是『只心跳不产出』的流仍会被判 stalled(providerio.go:256)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +43  ../zero/internal/providers/providerio/retry.go       # SendWithRetry + ShouldRetryStatus:哪些状态可重
+less +27  ../zero/internal/providers/providerio/auth.go        # SendWithAuthRetry:401 强制刷新重试一次
+less +18  ../zero/internal/providers/providerio/headers.go     # ApplyAuthHeaders:统一鉴权头优先级
+less +161 ../zero/internal/providers/providerio/providerio.go  # sharedHTTPClient:抗僵尸连接的三个旋钮
+less +256 ../zero/internal/providers/providerio/providerio.go  # ScanSSEDataWithContext:idle + content 双看门狗
+less +382 ../zero/internal/providers/providerio/providerio.go  # ClassifiedError + Redact:边界脱敏</code></pre>
+<p>
+读的顺序:先把 <code>retry.go</code> 的 <code>ShouldRetryStatus</code> 那条注释背下来 —— 「非幂等 POST,只重放证明没接活的失败」是理解整个包的钥匙。
+再看 <code>auth.go</code> 怎么把 401 归进同一类安全重放。最后跳到 <code>ScanSSEDataWithContext</code>,对读两个看门狗的重置规则 ——
+idle 被心跳重置、content 只被真数据重置,这一处不对称就是治「心跳不产出」挂死的全部智慧。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>CollectStreamWithOptions</code>(第一课)怎么把 <code>StreamEvent</code> 流<em>抽干</em>成 Text + ToolCalls 的?」、
+「沙箱引擎怎么在 <code>executeToolCall</code>(第二课)里真正隔离命令执行?」,
+或者「会话怎么 <code>/fork</code>、specialist 子会话(<code>EventSessionChild</code>)怎么挂到父会话上?」
+</div>
+
+<div class="nav">
+  <span>← 第九课:Provider 适配层</span>
+  <span>Provider 层完整两面(防腐层 + 共享层)已覆盖。下一步可选:沙箱引擎 / CollectStream 抽流 / 会话分叉与子会话</span>
+</div>
+
+<footer>Zero 架构课程 · 第十课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

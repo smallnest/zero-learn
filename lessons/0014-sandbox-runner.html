@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十四课 — 从判定到笼子:命令怎么被原生沙箱真正包裹</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十四课</p>
+<h1>把命令关进笼子:默认拒绝 + 一张长到眼晕的白名单</h1>
+
+<p>
+第十三课的引擎判完「放行」,只是说了句「可以跑」。这一课接着问:<strong>「跑」到底怎么被那层原生沙箱包起来?</strong>
+答案在 <code>runner.go</code>:它把一个 <code>CommandSpec</code>(要跑什么)先编译成一个纯数据的
+<code>CommandPlan</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:32</a>,再由 <code>CommandContext</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:70</a> 变成真正的 <code>exec.Cmd</code>。
+</p>
+
+<blockquote>
+对齐 mission:第十三课说「有真实 OS 隔离包着命令,才敢自动放行」。这一课就是那层隔离的<em>实体</em>。
+你会看到一个残酷的工程真相:一个「默认全拒」的沙箱理论上最安全,<strong>但会把几乎所有真实工具都跑挂</strong>。
+所以真正的沙箱 = 默认拒绝 + 一张<em>经验长出来</em>的允许清单。这张清单怎么长的,就是这一课。
+</blockquote>
+
+<h2>先分两步:计划(纯数据)与执行(真进程)</h2>
+<p>
+<code>BuildCommandPlan</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:106</a> 不启动任何东西,只产出一个可 JSON 序列化的 <code>CommandPlan</code>。
+计划里带着几个诚实字段:<code>Wrapped</code>(到底包没包)、<code>EnforcementLevel</code>、<code>DowngradeReason</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:38</a>。
+把「算出怎么跑」和「真的去跑」拆开,好处是计划可被<em>检视、审计、测试</em> —— 不必真执行就能看清「这条命令会不会被包裹」。
+</p>
+<div class="callout">
+<span class="label">诚实降级:计划绝不谎报 Wrapped</span>
+若强制级别是 disabled/degraded、或后端不可用,<code>buildPlatformCommandPlan</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:163</a> 直接返回一个 <code>directCommandPlan</code> ——
+<code>Wrapped: false</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:247</a>,原样透传、不包裹。
+这正是第十三课 <code>shellSandboxActive</code> 所<em>镜像</em>的同一事实:引擎判断说「已沙箱化」,当且仅当 runner 真的会包。
+声称的安全和实际的安全,在这两处必须一致 —— 否则就把裸奔命令当有保护放行了。
+</div>
+
+<h2>按平台分派:一个后端一台包裹机</h2>
+<p>
+<code>buildPlatformCommandPlan</code> 的 switch
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:166</a> 按后端选笼子:Linux 的
+<code>bwrap</code>(bubblewrap,<a class="cite" href="../../zero/internal/sandbox/runner.go">:167</a>)、macOS 的
+seatbelt / <code>sandbox-exec</code>(<a class="cite" href="../../zero/internal/sandbox/runner.go">:171</a>)、
+Windows 的受限令牌(<a class="cite" href="../../zero/internal/sandbox/runner.go">:175</a>)。
+包裹方式各不同,但产出的都是同一个 <code>CommandPlan</code> 形状 —— 上层拿到的接口一致,平台怪癖关在各自的 plan 构造里。
+(这与第九课「一个 Provider 接口喂饱各家模型」是同一种手法。)
+</p>
+
+<div class="callout">
+<span class="label">绝不二次包裹:re-entrancy 守卫</span>
+被包裹的进程再 spawn 子命令时,若检测到自己已在沙箱里(<code>ZERO_SANDBOXED=1</code> + backend 环境变量,见
+<code>IsAlreadySandboxed</code> <a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:134</a>),
+就把偏好设成 <code>Forbid</code>、返回透传计划。原因很实在:嵌套的平台包裹器会<em>直接失败</em>,而且第二层沙箱纯属冗余。
+</div>
+
+<h2>笼子的实体:<code>(deny default)</code> 打头,其余全靠显式允许</h2>
+<p>
+以 macOS seatbelt 为例,整张 profile 由 <code>seatbeltProfileFromPermissionProfile</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:561</a> 拼出,<strong>第一条就是默认全拒</strong>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:565</a>:
+</p>
+<pre><code>(version 1)
+(deny default)              // ← 什么都不许,除非下面显式 allow
+(allow process*)
+(allow signal)              // 见下方注释:内核仍按 UID 兜底
+...
+readRule / writeRule / networkRule</code></pre>
+<p>
+文件系统边界就是这里的 <code>writeRule</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:682</a>:受限时只允许写工作区那几个根 + 临时目录 + 一批标准字符设备
+(<code>/dev/null</code> 之类,<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:476</a>);网络则由 <code>networkRuleForProfile</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:803</a> 一句 <code>(deny network*)</code> 默认掐断。<strong>笼子的四壁 = 默认拒绝;门上的洞 = 逐条 allow。</strong>
+</p>
+
+<h2>为什么这张白名单长到眼晕 —— 每一行都在补一个真实翻车</h2>
+<p>
+纯粹的 <code>(deny default)</code> 会让真实工具寸步难行,于是 profile 里堆了大量<em>看似莫名</em>的允许,而每一条都对应一次被诊断出的失败:
+</p>
+<ul>
+<li><strong>Mach 服务白名单</strong> <a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:511</a>:不放行 <code>securityd</code>/<code>opendirectoryd</code>/<code>cfprefsd</code>,碰钥匙串、查用户组、读偏好的工具全挂 —— 但这些<em>都不给</em>文件或网络权限,工作区边界不受影响。</li>
+<li><strong>用户工具树</strong> <a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:830</a>:<code>/opt/homebrew</code>、<code>/usr/local</code> 要可读可 map-executable,否则一个 Homebrew 装的 <code>node</code>/<code>python3</code> 根本起不来。</li>
+<li><strong>祖先目录的 stat 洞</strong> <a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:896</a>:<code>realpath()</code> 会 lstat 路径的每一层祖先,少了它 Homebrew 的 python3 会以 <code>"realpath: /opt/homebrew/bin/: Operation not permitted"</code> 启动失败 —— 而只 <code>exec()</code> 的 node <em>不</em>受影响,这个不对称正是问题被诊断出来的线索。</li>
+</ul>
+<div class="callout warn">
+<span class="label">架构启示:沙箱的松紧是经验长出来的,不是设计出来的</span>
+你没法一次想全「一个 shell 命令会碰哪些系统资源」。所以这张 allowlist 是<em>被真实工具的崩溃反向逼出来的</em>,
+每个洞都带一句注释说明它修的是哪次翻车。<strong>太紧的沙箱不是安全,是不可用。</strong>
+真正的功夫,是在「默认拒绝」的骨架上,精准地只开必需的洞 —— 且每个洞都能论证它<em>不</em>破坏文件/网络边界。
+</div>
+
+<div class="callout">
+<span class="label">边界是文件系统/网络,不是环境变量</span>
+<code>sandboxEnvironmentForCommand</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:377</a> 默认<em>继承</em>调用方环境(<a class="cite" href="../../zero/internal/sandbox/runner.go">:380</a>)——
+沙箱的边界是 profile 里的文件/网络规则,不靠擦环境变量。同理 <code>(allow signal)</code>
+<a class="cite" href="../../zero/internal/sandbox/runner.go">runner.go:592</a> 敢放行发信号,是因为<em>内核仍按 UID 兜底</em>:沙箱命令以用户身份跑,只能杀用户自己的进程。
+每处放宽,都靠「另一层机制仍在兜底」来论证其安全。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么 <code>BuildCommandPlan</code> 只产出纯数据计划,而不直接启动进程?</p>
+  <button class="opt">因为构造进程对象的开销远大于先生成一份计划再执行它</button>
+  <button class="opt">计划可被检视审计测试,且 Wrapped 字段能诚实反映到底包没包</button>
+  <button class="opt">因为不同平台的进程启动接口差异太大必须先归一化再执行</button>
+  <button class="opt">因为计划需要先经过用户逐条确认之后才被允许真正地执行</button>
+  <div class="fb"
+    data-correct="对 —— 计划是可序列化纯数据(带 Wrapped/EnforcementLevel),不跑就能看清会不会被包;degrade 时返回 Wrapped:false 透传计划(runner.go:106)。"
+    data-wrong="计划把『怎么跑』与『真的跑』拆开:可审计可测试,Wrapped 诚实反映包裹与否,降级时透传不谎报(runner.go:247)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">seatbelt profile 里那一大堆看似莫名的 allow 规则,本质是什么?</p>
+  <button class="opt">是为兼容不同 macOS 版本而预留的一批冗余的保险规则</button>
+  <button class="opt">是为提升沙箱内命令执行速度而开的一组性能优化通道</button>
+  <button class="opt">默认全拒下逐个补上的洞,每条都对应一次真实工具的崩溃</button>
+  <button class="opt">是从系统默认配置里原样继承过来的一份基础权限模板</button>
+  <div class="fb"
+    data-correct="对 —— (deny default) 会让真实工具寸步难行;allowlist 是被崩溃反向逼出来的,每个洞带注释说明修哪次翻车,且论证不破坏文件/网络边界(runner.go:561)。"
+    data-wrong="它们是『默认拒绝』骨架上精准开的洞:每条补一个被诊断出的工具失败(如 Homebrew python3 起不来),太紧的沙箱不是安全是不可用(runner.go:830)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">一个已被沙箱包裹的进程再 spawn 子命令时,为什么不再包一层?</p>
+  <button class="opt">嵌套的平台包裹器会直接失败,且第二层沙箱纯属冗余无益</button>
+  <button class="opt">因为子命令会自动继承父进程已经建立好的全部隔离约束</button>
+  <button class="opt">因为再包一层会显著拖慢每一个子命令的实际启动速度</button>
+  <button class="opt">因为内核限制同一进程树里最多只能存在一层沙箱边界</button>
+  <div class="fb"
+    data-correct="对 —— IsAlreadySandboxed(ZERO_SANDBOXED=1+backend 环境)检测到已在笼中就设 Forbid、透传;嵌套平台包裹器会失败,二层冗余(runner.go:134)。"
+    data-wrong="re-entrancy 守卫:检测到已在沙箱内就不再包;嵌套包裹器会直接失败,第二层也是冗余的(runner.go:134)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +106 ../zero/internal/sandbox/runner.go   # BuildCommandPlan:编译成纯数据计划
+less +156 ../zero/internal/sandbox/runner.go   # buildPlatformCommandPlan:按后端分派 + 诚实降级
+less +134 ../zero/internal/sandbox/runner.go   # IsAlreadySandboxed 守卫:绝不二次包裹
+less +561 ../zero/internal/sandbox/runner.go   # seatbeltProfile:(deny default) + allowlist 拼装
+less +830 ../zero/internal/sandbox/runner.go   # macosPlatformReadRoots / :896 祖先 stat 洞:每行补一次翻车</code></pre>
+<p>
+读的顺序:先看 <code>CommandPlan</code> 的 <code>Wrapped</code>/<code>EnforcementLevel</code> 字段 —— 理解「计划诚实报告包裹与否」。
+再看 <code>buildPlatformCommandPlan</code> 的 switch 怎么按后端选笼子、怎么在 degrade 时透传。
+最后逐条读 seatbelt profile 里的注释 —— 那是全课精华:<code>(deny default)</code> 之后每一个 allow 都在讲「不开这个洞,哪个真实工具会怎么挂」。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>PermissionProfile</code> 怎么从 <code>Policy</code> + scope 算出来(<code>profile.go</code>/<code>pathlists.go</code>)?」、
+「<code>Classify</code>(<code>risk.go</code>)怎么认出破坏性/触网命令,好让第十三课的判定链拦下它?」,
+或者「<code>MonitorDenials</code> 那套 denial tag + <code>log stream</code> 怎么把沙箱到底拦了什么捞回来给用户?」
+</div>
+
+<div class="nav">
+  <span>← 第十三课:沙箱判定引擎</span>
+  <span>「判定 → 包裹」的执行侧已补全。下一步可选:权限画像与路径表 / 风险分类 / 拦截监控</span>
+</div>
+
+<footer>Zero 架构课程 · 第十四课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

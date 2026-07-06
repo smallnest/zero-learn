@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十一课 — CollectStreamWithOptions:把事件流「抽干」成一次结果</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十一课</p>
+<h1>抽流:一条 <code>StreamEvent</code> channel,同时喂给「画面」和「循环」</h1>
+
+<p>
+第九课给出了 provider 的出向词汇 —— 一条 <code>StreamEvent</code> 的 channel(9 种事件)。第六课讲了 TUI 怎么把这些事件
+<em>实时</em>画上屏。但第一课的循环最终要的不是「流」,而是一份<strong>攒齐的结果</strong>:这一轮模型说了什么文本、
+发起了哪些 tool call、用了多少 token。<code>CollectStreamWithOptions</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:90</a>
+就是这台「抽干机」:它一边把流<em>实时</em>转发给回调(喂画面),一边把它<em>攒</em>成一个
+<code>CollectedStream</code>(喂循环)。
+</p>
+
+<blockquote>
+对齐 mission:流式和非流式是同一份数据的两副面孔。一个 coding agent 既要让用户<em>看着</em>字一个个蹦出来(流),
+又要在这一轮结束后<em>拿到完整的</em>tool call 列表去执行(非流)。这一课就是把「流」优雅收束成「一次结果」的那个接缝 ——
+一次遍历,两个用途。
+</blockquote>
+
+<h2>核心形状:一个 for-select 抽干 channel,四条出口都走 finish()</h2>
+<p>
+函数主体就是一个 <code>for { select {...} }</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:102</a>,把 channel 抽到干。有<strong>四种</strong>方式结束,
+全部经由同一个 <code>finish()</code> 闭包收尾:
+</p>
+<table style="border-collapse:collapse;width:100%;font-size:0.9rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">出口</th><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">触发</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem"><code>ctx.Done()</code></td><td style="padding:.4rem .6rem">取消 → 记 <code>Error=ctx.Err()</code>(helpers.go:104)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">channel 关闭</td><td style="padding:.4rem .6rem"><code>ok==false</code> → 正常收尾(helpers.go:108)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem"><code>StreamEventError</code></td><td style="padding:.4rem .6rem">记 <code>Error</code> 立即返回(helpers.go:155)</td></tr>
+<tr><td style="padding:.4rem .6rem"><code>StreamEventDone</code></td><td style="padding:.4rem .6rem">正常终止(helpers.go:158)</td></tr>
+</table>
+<p>
+<code>finish()</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:94</a> 做两件事:<code>collector.flush()</code>
+把攒的 tool call 和文本落定,并在<em>见过 usage 时</em>补发一次 <code>OnUsage</code>。<strong>关键在「单一收尾点」</strong>:
+无论从哪条出口走,flush 恰好被调一次 —— 这是文本只被物化一次、tool call 只被输出一次的保证。
+</p>
+
+<h2>两副面孔:同一个 switch 里,攒 + 转发</h2>
+<p>
+每个事件在 <code>switch event.Type</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:125</a> 里同时做两件事 —— <em>攒进结果</em> 和 <em>转发给回调</em>:
+</p>
+<pre><code>case StreamEventText:
+    collector.text.WriteString(event.Content)   // 攒(给循环)
+    if options.OnText != nil { options.OnText(...) }  // 转发(给画面)
+case StreamEventToolCallStart:
+    collector.start(id, name, signature)         // 攒
+    if options.OnToolCallStart != nil { ... }    // 转发
+case StreamEventToolCallDelta: ...  // 攒参数片段 + 转发
+case StreamEventUsage:  collected.Usage = mergeUsageSnapshot(...)
+case StreamEventToolCallDropped: collected.DroppedToolCalls++</code></pre>
+<p>
+这正是第六课那些回调(<code>OnText</code>/<code>OnToolCallStart</code>/<code>OnToolCallDelta</code>/<code>OnUsage</code>)的<strong>来源</strong>:
+<code>CollectOptions</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:34</a> 就是 TUI 挂进来那组闭包。<em>不需要回调</em>的调用方
+(会话标题、recap、压缩)传空 options,抽流就退化成纯粹的「攒」。<strong>一个函数,流式和非流式两用。</strong>
+</p>
+
+<div class="callout">
+<span class="label">两个「骑在任意事件上」的字段</span>
+<code>FinishReason</code>(截断/内容过滤)和 <code>ReasoningBlocks</code>(Anthropic thinking)<strong>不</strong>按类型 case 处理,
+而是在 switch <em>之前</em>无条件累积
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:116</a>。因为 provider 会把它们挂在自己的终止事件上,
+类型不定 —— 无条件收集,才不会漏掉一个「其实被截断了」的响应,也不会丢掉要在下一轮<em>重放</em>的思考块(呼应第九课)。
+</div>
+
+<h2>硬骨头:<code>toolCallCollector</code> —— 为什么「攒」而不是「end 即发」</h2>
+<p>
+tool call 是流式到达的:<code>start</code>(给 id+name)、若干 <code>delta</code>(参数片段一点点拼)、<code>end</code>。
+最容易想到的是「<code>end</code> 时就把这个 call 发出去」。Zero 偏不 —— <code>end</code> 什么都不发
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:278</a>,只有 <code>flush</code> 在最后<strong>按 start 顺序</strong>一次性全发
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:319</a>。
+</p>
+<div class="callout">
+<span class="label">为什么坚持 start 顺序</span>
+多个 tool call 可能<em>并发</em>流式,谁先 <code>end</code> 是不确定的。若「end 即发」,输出顺序就随机了。
+攒进 <code>order</code> 切片、flush 时按 start 顺序遍历 —— 保证 agent 拿到的 tool call 列表<strong>永远等于模型发起它们的顺序</strong>,
+与谁先拼完参数无关。这对可复现的执行顺序很重要。
+</div>
+
+<h3>空 ID 的泥潭:合成 key + delta 先到的收养</h3>
+<p>
+有的后端不给 tool call 分配 ID(<code>id==""</code>)。天真地用 ID 当 map key,两个并发的空 ID call 就会<strong>合并成一个</strong>。
+collector 用一套机制把它们分开:
+</p>
+<ul>
+<li><strong>空 ID → 合成 key</strong>:每个空 ID 的 start 都造一个 <code>\x00synthetic-N</code> 的独立 key,压进一个栈
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:238</a>;delta/end 用「栈顶那个最近打开的」来路由
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:294</a>。</li>
+<li><strong>delta 先于 start 到达</strong>:一个空 ID 的 delta 若在任何 start 之前就来了,就地开一个合成 call 并记下
+<code>pendingEmptyDelta</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:266</a>;紧接着的空 ID start <em>收养</em>这个 call
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:234</a>,而不是另开一个 —— 于是先到的参数片段不会变成「无主孤儿」。</li>
+<li><strong>无名 call 被丢弃</strong>:flush 时 <code>Name==""</code> 的 call 不进 <code>ToolCalls</code>,而是计入 <code>DroppedToolCalls</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:326</a> —— agent 绝不派发一个空工具名。</li>
+</ul>
+
+<h2>两处小而正确的决定</h2>
+<ul>
+<li><strong>文本用 <code>strings.Builder</code> 而非 <code>+=</code></strong>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:130</a>:<code>collected.Text += chunk</code> 每次都重新分配整个字符串,
+长响应下是 O(n²)。攒进 Builder、flush 时物化一次。</li>
+<li><strong>Usage 逐字段取最新非零</strong>:<code>mergeUsageSnapshot</code>
+<a class="cite" href="../../zero/internal/zeroruntime/helpers.go">helpers.go:165</a> 合并多次 usage 快照(有些 provider 分多次报),
+每个字段保留最新的非零值,再走第九课的 <code>NormalizeUsage</code> 校验不变量。</li>
+</ul>
+
+<div class="callout warn">
+<span class="label">这一课接住了两条线</span>
+<strong>第九课</strong>产出 9 种事件的流;<strong>本课</strong>把流抽干成一个 <code>CollectedStream{Text, ToolCalls, Usage, ...}</code>;
+<strong>第一课</strong>的循环拿这个结果:有 <code>ToolCalls</code> 就去执行(第二课的关卡)、没有就结束这一轮。而<strong>第六课</strong>的实时画面,
+不过是给同一次抽流传了一组回调。<em>流式 UI 与非流式循环,共用这一次遍历</em> —— 没有第二份解析逻辑,也就没有两者不一致的机会。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">tool call 为什么在 <code>flush</code> 统一发,而不在 <code>end</code> 时就发?</p>
+  <button class="opt">因为 end 事件里并不携带工具名和参数的完整信息</button>
+  <button class="opt">并发调用完成顺序不定,按 start 顺序发才与模型发起顺序一致</button>
+  <button class="opt">因为 flush 阶段才能安全地对参数做一次完整校验</button>
+  <button class="opt">为了减少回调次数从而显著降低界面的渲染开销</button>
+  <div class="fb"
+    data-correct="对 —— 并发 call 的 end 顺序随机;攒进 order 切片、flush 按 start 顺序遍历,保证输出=模型发起顺序(helpers.go:319)。"
+    data-wrong="因为并发 call 谁先 end 不定;按 start 顺序在 flush 统一发,输出才等于模型发起顺序(helpers.go:319)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q"><code>FinishReason</code> 和 <code>ReasoningBlocks</code> 为什么在 switch 之前无条件收集?</p>
+  <button class="opt">provider 把它们挂在类型不定的终止事件上,无条件收集才不漏</button>
+  <button class="opt">因为这两个字段的处理开销比其它事件类型都要小</button>
+  <button class="opt">因为它们只会出现在文本事件上而不在工具事件上</button>
+  <button class="opt">为了让代码结构更简洁从而减少 switch 的分支数量</button>
+  <div class="fb"
+    data-correct="对 —— 它们可骑在任意终止事件上(类型不定);switch 前无条件累积,才不漏截断标记、不丢要重放的思考块(helpers.go:116)。"
+    data-wrong="因为 provider 把它们挂在类型不定的终止事件上,无条件累积才不会漏掉截断标记或要重放的思考块(helpers.go:116)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">同一个 <code>CollectStreamWithOptions</code> 怎么同时服务流式 UI 和非流式循环?</p>
+  <button class="opt">通过一个布尔开关在流式与非流式两种模式间来回切换</button>
+  <button class="opt">流式调用另起一个 goroutine,非流式则同步阻塞地执行</button>
+  <button class="opt">遍历中既攒进 CollectedStream,又把每个事件转发给可选回调</button>
+  <button class="opt">先完整攒好结果,再一次性把所有事件回放给界面渲染</button>
+  <div class="fb"
+    data-correct="对 —— 同一 switch 里:攒进 collector(给循环)+ 调 CollectOptions 回调(给画面);不传回调就退化成纯攒(helpers.go:125)。"
+    data-wrong="一次遍历里既攒进 CollectedStream 又转发给可选回调;传回调=喂 UI,传空=纯攒给循环(helpers.go:125)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +90  ../zero/internal/zeroruntime/helpers.go   # CollectStreamWithOptions:for-select 抽干 + 四条出口
+less +94  ../zero/internal/zeroruntime/helpers.go   # finish():单一收尾点,flush 只调一次
+less +204 ../zero/internal/zeroruntime/helpers.go   # toolCallCollector:攒调用、按 start 顺序 flush
+less +229 ../zero/internal/zeroruntime/helpers.go   # start/delta/end:空 ID 合成 key + delta 收养
+less +165 ../zero/internal/zeroruntime/helpers.go   # mergeUsageSnapshot:逐字段取最新非零</code></pre>
+<p>
+读的顺序:先看主 <code>for-select</code> 的四条出口都汇到 <code>finish()</code> —— 理解「单一收尾点」。再看 switch 里每个 case
+「攒 + 转发」的对称。最后啃 <code>toolCallCollector</code> 的空 ID 处理 —— 合成 key、delta 先到的收养、无名丢弃,
+这是全函数唯一需要多读两遍的地方,也是把「乱序、缺 ID、并发」的真实流式收得干净的功夫所在。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>loop.go</code> 里为什么要在一次 collect 失败后用 <code>retryStream</code> 再 collect 一遍(loop.go:266/:325)?」、
+「沙箱引擎怎么在 <code>executeToolCall</code>(第二课)里真正隔离命令执行?」,
+或者「会话怎么 <code>/fork</code>、specialist 子会话(<code>EventSessionChild</code>)怎么挂到父会话上?」
+</div>
+
+<div class="nav">
+  <span>← 第十课:providerio 共享层</span>
+  <span>循环↔provider 的收束接缝已补全。下一步可选:沙箱引擎 / 会话分叉与子会话 / loop 的重试路径</span>
+</div>
+
+<footer>Zero 架构课程 · 第十一课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

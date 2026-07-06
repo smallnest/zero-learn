@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第九课 — Provider 适配层:一个接口喂饱 25+ 家模型</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第九课</p>
+<h1>Provider 适配层:把厂商的怪癖挡在门外</h1>
+
+<p>
+第一课点过那条最重要的接缝:整个循环只跟一个 <code>Provider</code> 接口对话,<em>从不点名任何厂商</em>。
+这一课把它彻底拆开 —— 看 Zero 怎么用<strong>一个只有一个方法的接口 + 一小撮规范化词汇</strong>,
+让循环、护栏、压缩、TUI、会话全都对「后面接的是 Anthropic 还是 Gemini 还是某个自建
+OpenAI-兼容端点」<strong>一无所知</strong>。这就是支持 25+ provider 的全部秘密。
+</p>
+
+<blockquote>
+对齐 mission:如果你要自己写一个 coding agent,这一课是<em>最该抄的架构决策</em>。选对这一条边界,
+后面每加一家模型都是「写一个适配器」;选错了,厂商的怪癖会渗进你代码的每个角落。
+</blockquote>
+
+<h2>接缝:一个方法,进出都是规范化的值</h2>
+<pre><code>type Provider interface {                                    // types.go:209
+    StreamCompletion(ctx, request CompletionRequest) (&lt;-chan StreamEvent, error)
+}</code></pre>
+<p>
+进去的是规范化的 <code>CompletionRequest{Messages, Tools, ReasoningEffort}</code>
+<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:197</a>,
+出来的是一条 <code>StreamEvent</code> 的 channel。循环只认这两个类型。<code>StreamEvent</code> 的
+<code>Type</code> 是一个<strong>极小的封闭词汇表</strong> ——
+<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:37</a>:
+</p>
+<pre><code>text · reasoning · tool-call-start · tool-call-delta · tool-call-end
+tool-call-dropped · usage · done · error</code></pre>
+<p>
+无论后端的线上协议长什么样,适配器<strong>必须</strong>把它翻译成<em>恰好这几种</em>事件。上游的循环、
+第六课的 TUI、第四课的护栏,看到的永远是这套统一词汇 —— 它们不知道、也不需要知道厂商是谁。
+</p>
+
+<h2>适配器 = 防腐层(anti-corruption layer)</h2>
+<p>
+每个 <code>internal/providers/&lt;家&gt;/</code> 目录就是一个把厂商怪癖<strong>隔离在内</strong>的防腐层。
+以 Anthropic 为例,它的 <code>StreamCompletion</code>
+<a class="cite" href="../../zero/internal/providers/anthropic/provider.go">provider.go:150</a>
+做两个方向的翻译:
+</p>
+<h3>入向:规范化请求 → 厂商线上格式</h3>
+<p>
+<code>anthropicRequest</code> / <code>mapMessages</code>
+<a class="cite" href="../../zero/internal/providers/anthropic/provider.go">provider.go:361</a>、
+<a class="cite" href="../../zero/internal/providers/anthropic/provider.go">provider.go:411</a>
+把统一的 <code>Message</code> 列表塑成 Anthropic 的 Messages API 形状:system 被<em>单独抽出</em>
+(Anthropic 的 system 不在 messages 数组里)、<code>thinking</code>/<code>redacted_thinking</code> 块按其
+content-block 模型还原。
+</p>
+<h3>出向:厂商 SSE 事件 → 规范化 StreamEvent</h3>
+<p>
+<code>emitPayload</code>
+<a class="cite" href="../../zero/internal/providers/anthropic/provider.go">provider.go:237</a>
+是一台翻译机:把 Anthropic 的 <code>content_block_delta</code> 里的 <code>text_delta</code> 译成
+<code>StreamEventText</code>、<code>input_json_delta</code> 译成 tool-call-delta、<code>thinking_delta</code>
+译成 reasoning、<code>message_stop</code> 译成 <code>done</code>……
+</p>
+<pre><code>switch payload.Type {
+case "content_block_delta":
+    switch payload.Delta.Type {
+    case "text_delta":       // → StreamEventText
+    case "input_json_delta": // → tool-call-delta
+    case "thinking_delta":   // → reasoning
+    }
+case "message_stop":         // → StreamEventDone
+case "error":                // → StreamEventError(已脱敏)
+}</code></pre>
+<div class="callout">
+<span class="label">怪癖被关在哪</span>
+Anthropic 的 content-block 流模型、Gemini 的 <code>thoughtSignature</code>、OpenAI 的
+<code>reasoning_effort</code> 和 Codex 的特殊鉴权头 —— 每一样都<strong>只活在自己那个适配器里</strong>。
+循环侧看到的永远是那 9 种规范化事件。加一家新 provider = 新写一个这样的双向翻译器,
+其余子系统<strong>一行都不用改</strong>。
+</div>
+
+<h2>规范化的几处硬功夫</h2>
+<ul>
+<li><strong>Usage 有统一不变量。</strong> <code>Usage</code>
+<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:134</a> 规定:
+<code>InputTokens</code> 是<em>总</em>提示大小,<code>CachedInputTokens</code>/<code>CacheWriteTokens</code> 是它的
+<em>子集</em>。每个适配器把自家五花八门的用量字段映射进这一个结构 —— 于是第三课的压缩阈值、预算统计
+在所有厂商下算法<em>完全一致</em>。</li>
+<li><strong>ReasoningEffort 是规范化的旋钮。</strong> 统一的 "minimal/low/medium/high"
+<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:200</a>,
+各适配器各自映射(OpenAI 的 <code>reasoning_effort</code>、Anthropic/Gemini 的 thinking budget),
+不支持推理的模型直接忽略。</li>
+<li><strong>ImageBlock 存原始字节。</strong> <code>Data</code> 是解码后的裸图字节(无 base64、无
+<code>data:</code> 前缀),各适配器编码成自家格式;<code>NormalizeImageMediaType</code> 在边界把 MIME
+收敛到白名单。<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:216</a></li>
+<li><strong>不透明产物被原样携带以便重放。</strong> <code>ReasoningBlocks</code>(Anthropic thinking 块)、
+<code>ToolCallSignature</code>(Gemini thoughtSignature)对循环是黑盒,但被透传保存 ——
+中途<em>换 provider</em> 时,外来的块会被忽略。<a class="cite" href="../../zero/internal/zeroruntime/types.go">types.go:190</a></li>
+<li><strong>连失败都规范化。</strong> 模型发起了一个线上格式无法表达的工具调用,译成
+<code>StreamEventToolCallDropped</code> —— 一个统一信号,而不是各家一种错法。</li>
+</ul>
+
+<h2>工厂:连「选哪个适配器」也隔离掉</h2>
+<p>
+<code>providers.New</code>
+<a class="cite" href="../../zero/internal/providers/factory.go">factory.go:38</a>
+按解析出的 <code>providerKind</code> 挑适配器。有个考究的特例:Codex(ChatGPT 后端)不按 kind 分,
+而按<em>目录 catalog id</em> 分叉 ——
+<a class="cite" href="../../zero/internal/providers/factory.go">factory.go:47</a>
+因为它的后端对每个缺 <code>originator</code> + <code>chatgpt-account-id</code> 头的请求都 401,
+必须用 Codex 风味的 provider;而其他「OpenAI-兼容」端点走普通 <code>openai.New</code> 不受影响。
+<strong>选择逻辑的怪癖,也被关在工厂里。</strong>
+</p>
+
+<div class="callout warn">
+<span class="label">为什么这是全库最重要的边界</span>
+循环(1)、护栏(4)、压缩(3)、TUI(6)、会话(7/8)—— 全部写在<em>这一个小接口 + 9 种事件</em>之上。
+它们从不 <code>import</code> 任何具体 provider 包。这就是<strong>依赖倒置</strong>的教科书落地:
+高层策略依赖抽象,厂商细节依赖抽象<em>去实现自己</em>。抄 agent 架构,先抄这条缝。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q"><code>Provider</code> 接口的规范化「出向词汇」是什么?</p>
+  <button class="opt">每家 provider 各自定义的原始 SSE 事件</button>
+  <button class="opt">一个大而全、涵盖所有厂商字段的联合结构</button>
+  <button class="opt">一张极小的封闭事件表:text/reasoning/tool-call-*/usage/done/error</button>
+  <button class="opt">直接透传厂商返回的 JSON 字节</button>
+  <div class="fb"
+    data-correct="对 —— StreamEventType 是封闭小词汇,每个适配器把自家 SSE 译成恰好这几种(types.go:37)。"
+    data-wrong="是一张封闭小事件表(text/reasoning/tool-call-*/usage/done/error);适配器负责翻译进这几种(types.go:37)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">要新增支持一家新模型厂商,需要动哪些代码?</p>
+  <button class="opt">只写一个新适配器做双向翻译,循环/护栏/TUI 都不改</button>
+  <button class="opt">在循环里加一个该厂商的分支判断</button>
+  <button class="opt">给护栏和压缩各加一套厂商特例</button>
+  <button class="opt">修改 StreamEvent 结构以容纳新字段</button>
+  <div class="fb"
+    data-correct="对 —— 适配器是防腐层,厂商怪癖关在里面;上游只认规范化接口,一行不用改(provider.go:237)。"
+    data-wrong="只需新写一个双向翻译的适配器;上游子系统都写在规范化接口上,无需改动(factory.go:38)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么各家不同的 token 用量要映射进统一的 Usage 结构?</p>
+  <button class="opt">为了让 TUI 显示更好看</button>
+  <button class="opt">让压缩阈值、预算统计在所有 provider 下算法完全一致</button>
+  <button class="opt">因为 provider 要求上报统一格式</button>
+  <button class="opt">为了减少内存占用</button>
+  <div class="fb"
+    data-correct="对 —— Usage 有统一不变量(InputTokens 为总量,cached/write 是子集),故第三课压缩/预算跨厂商一致(types.go:134)。"
+    data-wrong="统一 Usage(含不变量:InputTokens 是总量,cached/write 为子集)让压缩阈值与预算跨厂商算法一致(types.go:134)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +175 ../zero/internal/zeroruntime/types.go        # StreamEvent + StreamEventType 封闭词汇
+less +134 ../zero/internal/zeroruntime/types.go        # Usage 的规范化不变量
+less +38  ../zero/internal/providers/factory.go        # New:按 kind 选适配器 + Codex 特例
+less +237 ../zero/internal/providers/anthropic/provider.go # emitPayload:SSE→规范事件翻译机
+less +361 ../zero/internal/providers/anthropic/provider.go # anthropicRequest:规范请求→线上格式</code></pre>
+<p>
+读的顺序:先把 <code>StreamEventType</code> 那 9 个常量背下来 —— 那是循环眼里世界的全部。再挑
+<code>anthropic/provider.go</code> 的 <code>emitPayload</code> 一个 <code>switch</code>,看它怎么把厂商 SSE
+逐条译成规范事件。最后翻一眼 <code>factory.go</code>,确认连「选谁」都没泄漏进上游。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>providerio</code> 那层(<code>retry.go</code>/<code>headers.go</code>/<code>auth.go</code>)在所有适配器间共享了什么?」、
+「<code>CollectStreamWithOptions</code>(第一课)怎么把这条事件流<em>抽干</em>成 Text+ToolCalls 的?」,
+或者「中途 <code>/model</code> 换 provider 时,前一家的 <code>ReasoningBlocks</code> 为什么必须被忽略?」
+</div>
+
+<div class="nav">
+  <span>← 第八课:会话回放</span>
+  <span>已覆盖:循环五要素 + TUI + 持久化三部曲 + Provider 适配。下一步可选:沙箱引擎 / providerio 共享层 / specialist 子会话</span>
+</div>
+
+<footer>Zero 架构课程 · 第九课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

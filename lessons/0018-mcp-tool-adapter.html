@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十八课 — MCP 接入:一个外部进程的工具,怎么变成注册表里的一等公民</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十八课</p>
+<h1>把「别人进程里的工具」包成本地 Tool:一个适配器 + 一条不信任边界</h1>
+
+<p>
+第十七课的注册表只认一件事:满足 <code>Tool</code> 接口的对象。这一课问:一个跑在<em>另一个进程</em>里的 MCP 工具
+——它的代码你没有、它的 schema 是运行时才吐出来的、它随时可能连不上——怎么变成注册表里一个和内建工具<strong>一模一样</strong>的对象?
+答案是一个适配器 <code>registryTool</code> <a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:242</a>,
+外加一条<strong>「宿主说了算」的不信任边界</strong>。
+</p>
+
+<blockquote>
+对齐 mission:一个现代 coding agent 的杀手锏,是能把<em>任意外部能力</em>(数据库、浏览器、公司内部 API)通过 MCP 挂进来。
+但外部工具是不受信的第三方:它的 schema 格式你不能假设、它的进程可能挂、它更<strong>不该由它自己说「我很安全,自动放行我」</strong>。
+这一课的功夫,是看 Zero 怎么用<em>一个适配器</em>抹平「远程 vs 本地」,又用<em>一条边界</em>确保外部工具永远越不过宿主的安全裁决——
+可扩展到无限,却一寸也不松安全。
+</blockquote>
+
+<h2>适配器:5 个方法全部「转译 + 委托」</h2>
+<p>
+<code>registryTool</code> 实现了第十七课那 5 个方法,但它自己不干活,只是把每个方法翻译成对远程的调用或对元数据的读取:
+</p>
+<pre><code>func (t registryTool) Name() string        { return t.name }              // 合成的本地名
+func (t registryTool) Parameters() Schema  { return t.parameters }         // 转译自远程 schema
+func (t registryTool) Safety() Safety      { return t.safety }             // ← 宿主合成,非远程声明
+func (t registryTool) Run(ctx, args) Result {
+    result, err := t.client.CallTool(ctx, t.remote.Name, args)  // 委托给远程   registry.go:308
+    ...
+}                                                                // registry.go:272-329</code></pre>
+<p>
+关键在于:一旦包成 <code>registryTool</code>,<strong>上层再也分不出它是远程的</strong>。第十七课的注册表、第十三课的沙箱、第二课的闸门,
+拿到的都是一个普通 <code>Tool</code>。远程的怪癖(JSON-RPC、进程、超时)全被关进适配器内部——这与第九课「一个 Provider 接口喂饱各家模型」是同一种<em>防腐层</em>手法,只是这次被适配的是「另一个进程的工具」。
+</p>
+
+<h2>三样元数据的三种来源</h2>
+<p>
+适配器在 <code>newRegistryTool</code> <a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:251</a>
+里组装。注意三样东西各有出处,尤其 <code>Safety</code>:
+</p>
+<table style="border-collapse:collapse;width:100%;font-size:0.85rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">字段</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">来源</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">为什么</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem"><code>Name</code></td><td style="padding:.3rem .5rem"><code>registryToolName</code> 合成 <a class="cite" href="../../zero/internal/mcp/registry.go">:339</a></td><td style="padding:.3rem .5rem"><code>mcp_&lt;server&gt;_&lt;tool&gt;</code>,加命名空间防撞、剔非法字符</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem"><code>Parameters</code></td><td style="padding:.3rem .5rem"><code>SchemaFromMCP</code> 转译 <a class="cite" href="../../zero/internal/mcp/schema.go">schema.go:10</a></td><td style="padding:.3rem .5rem">远程松散的 <code>map[string]any</code> → Zero 的类型化 <code>Schema</code></td></tr>
+<tr><td style="padding:.3rem .5rem"><code>Safety</code></td><td style="padding:.3rem .5rem"><strong>宿主合成</strong> <a class="cite" href="../../zero/internal/mcp/registry.go">:264</a></td><td style="padding:.3rem .5rem">远程<em>无权</em>声明自己的危险度(见下)</td></tr>
+</table>
+
+<div class="callout warn">
+<span class="label">最关键的一处:Safety 由宿主强加,不容远程自评</span>
+每个 MCP 工具的 <code>Safety</code> 被<strong>硬编码</strong>成 <code>SideEffect: Network</code> + <code>Permission: Prompt</code>
+(除非用户此前持久授权过才升到 <code>Allow</code>,<a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:255</a>)。
+远程工具<em>吐回来的清单里根本没有安全字段可填</em>——因为 Zero 不采信第三方的自我评估:一个外部工具若能自称「我无害,自动放行我」,
+就等于把第十七课的安全裁决权交给了不受信的人。<strong>连「声明自己是什么」这个权利,外部工具也不给。</strong>
+它只能被当作「触网、默认询问」,判定权牢牢留在第十三课的沙箱引擎手里。
+</div>
+<p>
+这正是第十七课的呼应:那里内建工具用 <code>Safety</code> 声明式元数据「说自己是什么」,是因为内建工具是<em>可信的自己人</em>。
+到了 MCP,同一个 <code>Safety</code> 字段改由<em>宿主</em>填——机制没变,信任边界变了。
+</p>
+
+<h2>延迟广告:MCP 工具默认「藏起来」</h2>
+<p>
+适配器还实现了第十七课的可选接口 <code>Deferred() bool { return true }</code>
+<a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:295</a>——<strong>每个 MCP 工具都是可延迟的,而内建工具不实现这个接口、保持 eager</strong>。
+原因就是第五课的 prompt 预算:接十个 MCP server 可能来上百个工具,全把 schema 塞进 prompt 会爆。所以 MCP 工具平时不进 prompt,靠 tool_search 按需现身。
+「远程能力无限扩展」与「prompt 预算有限」的矛盾,就用这一个布尔方法化解。
+</p>
+
+<h2>连接:一个 <code>ToolClient</code> 接口,抹平 stdio / http / sse</h2>
+<p>
+适配器持有的 <code>client</code> 是个 <code>ToolClient</code> 接口,只有三个方法
+<a class="cite" href="../../zero/internal/mcp/client.go">client.go:34</a>:<code>ListTools</code> / <code>CallTool</code> / <code>Close</code>。
+<code>Connect</code> <a class="cite" href="../../zero/internal/mcp/client.go">client.go:74</a> 按传输类型分派——stdio 拉起子进程、http/sse 走网络——但产出的都是同一个 <code>ToolClient</code>。
+又一次「一个接口喂饱多种后端」(第九课 Provider、第十四课沙箱后端的同款手法):适配器只跟接口打交道,传输怪癖关在各自实现里。
+</p>
+
+<h2>启动:best-effort + 「并发 I/O,串行提交」</h2>
+<p>
+外部进程随时可能连不上。<code>RegisterTools</code> <a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:63</a>
+的整套设计都在防「一个坏 server 拖垮全局」:
+</p>
+<ul>
+<li><strong>best-effort per server</strong>:一个连不上、超时、或吐了个无名工具的 server 被<em>跳过并记录</em>(<code>SkippedServer</code> <a class="cite" href="../../zero/internal/mcp/registry.go">:35</a>),而不是让启动失败或禁掉其余 server。慢 server 也拖不慢首个模型响应。</li>
+<li><strong>并发连接,串行提交</strong>:连接 + list 是纯 I/O、不碰共享状态,所以<em>并发</em>跑,每个 server 一个带超时的 context(<a class="cite" href="../../zero/internal/mcp/registry.go">:106</a>);而校验、冲突检测、注册全在<em>串行</em>阶段按 server 顺序做(<a class="cite" href="../../zero/internal/mcp/registry.go">:148</a>)。于是结果与「谁先连上」无关——完成顺序不影响最终注册。</li>
+<li><strong>冲突即跳过,且 all-or-none</strong>:一个 server 的工具名若和注册表、或更早 server、或同 server 内其它工具撞了,整个 server 被跳过(<code>buildServerTools</code> <a class="cite" href="../../zero/internal/mcp/registry.go">:199</a>)——不留半套。</li>
+</ul>
+<div class="callout">
+<span class="label">为什么超时的 context 一定要 cancel</span>
+stdio server 的子进程<em>系在 context 上</em>。连接超时被放弃时立刻 <code>cancel()</code>
+<a class="cite" href="../../zero/internal/mcp/registry.go">registry.go:126</a> 撕掉半开的连接/子进程;而<em>保留</em>的 server 其 context 要一直活到 <code>Close</code>
+——否则子进程会被提前杀掉。这是「外部进程生命周期系在 Go context 上」的一个必须小心的细节。
+</div>
+
+<h2>合起来看:一层适配器,两个方向的保证</h2>
+<p>
+<strong>向上</strong>,适配器把远程工具伪装成一个再普通不过的 <code>Tool</code>,让第十七课的注册表、第十三课的沙箱、第二课的闸门都无需知道 MCP 的存在——<em>可扩展</em>。
+<strong>向内</strong>,它把 <code>Safety</code> 的填写权从远程夺回宿主,把连接失败隔离成「跳过一个」,把 prompt 膨胀交给延迟广告——<em>安全与稳健</em>。
+一个外部进程的工具,就这样成了注册表里的一等公民,却始终越不过宿主画下的那条线。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">外部 MCP 工具靠什么变得能被注册表/沙箱/闸门<em>一视同仁</em>地使用?</p>
+  <button class="opt">上层循环为每个远程工具各写一段专门的远程调用分支来驱动</button>
+  <button class="opt">远程服务器主动把它的工具逐个注册进宿主进程内的那张工具表</button>
+  <button class="opt">一个适配器把远程工具包成满足本地工具接口的对象供上层调用</button>
+  <button class="opt">宿主把整个远程进程直接内联加载进自己的地址空间里执行运行</button>
+  <div class="fb"
+    data-correct="对 —— registryTool 适配器实现那 5 个方法,全部转译/委托给远程;包好后上层分不出它是远程的,MCP 怪癖关在适配器内(registry.go:242,防腐层同第九课)。"
+    data-wrong="靠 registryTool 适配器:5 个方法转译+委托远程,上层拿到的就是普通 Tool,远程 vs 本地被抹平(registry.go:272)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">一个 MCP 工具的 <code>Safety</code>(危险度/权限)到底是谁决定的?</p>
+  <button class="opt">由远程服务器在返回工具清单时一并声明它自己的危险等级值</button>
+  <button class="opt">由宿主统一强加为网络副作用加默认询问,绝不采信远程自评</button>
+  <button class="opt">从该工具上一次被调用时的实际行为里推断出来并缓存起复用</button>
+  <button class="opt">由模型在决定要调用它的那一刻临时给出一个即时风险评估值</button>
+  <div class="fb"
+    data-correct="对 —— MCP 工具的 Safety 被硬编码成 Network+Prompt(用户持久授权过才升 Allow);远程清单里根本没安全字段。不受信的第三方无权自称『我无害,自动放行』(registry.go:264)。"
+    data-wrong="Safety 由宿主强加(SideEffect:Network + Permission:Prompt),远程无权自评;这与第十七课内建工具自我声明的区别是:信任边界不同(registry.go:264)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">启动时某个 MCP 服务器连不上或超时,为什么不直接让整个启动失败?</p>
+  <button class="opt">best-effort:跳过并记录该服务器,既不拖慢首答也不禁用其余</button>
+  <button class="opt">连接失败会先自动重试整整三次,三次都失败后才中止启动流程</button>
+  <button class="opt">所有服务器改为串行连接,任一失败即回滚已连接的全部服务器</button>
+  <button class="opt">失败的服务器会被降级成只读模式后仍强行注册进那张工具表里</button>
+  <div class="fb"
+    data-correct="对 —— best-effort per server:连不上/超时/无名工具的 server 被跳过并记进 SkippedServer,不让启动失败也不禁其余;慢 server 拖不慢首个模型响应(registry.go:35/:151)。"
+    data-wrong="best-effort:坏 server 跳过并记录(SkippedServer),不 fatal、不禁其余;并发连接+串行提交让结果与完成顺序无关(registry.go:63)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +242 ../zero/internal/mcp/registry.go   # registryTool:适配器的 5 个方法(转译+委托)
+less +251 ../zero/internal/mcp/registry.go   # newRegistryTool:Name 合成 / Schema 转译 / Safety 宿主强加
+less +63  ../zero/internal/mcp/registry.go   # RegisterTools:best-effort + 并发连接 + 串行提交
+less +34  ../zero/internal/mcp/client.go     # ToolClient 接口:ListTools/CallTool/Close 抹平传输
+less +74  ../zero/internal/mcp/client.go     # Connect:按 stdio/http/sse 分派,产出同一 ToolClient
+less +10  ../zero/internal/mcp/schema.go     # SchemaFromMCP:远程 map[string]any → 类型化 Schema</code></pre>
+<p>
+读的顺序:先看 <code>registryTool</code> 的 5 个方法怎么全部委托给 <code>client</code>——体会「适配器让远程工具对上层透明」。
+再精读 <code>newRegistryTool</code> 里 <code>Safety</code> 那段硬编码,想清楚「为什么外部工具连声明危险度的权利都没有」。
+最后看 <code>RegisterTools</code> 的并发/串行两阶段和 best-effort 跳过——那是「和不可靠外部进程打交道」的稳健范式。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「MCP 权限的<em>持久化</em>——一次 <code>/allow</code> 之后 <code>isPersistentlyApproved</code>(<a class="cite" href="../../zero/internal/mcp/permissions.go">permissions.go</a>)靠什么把下次同类调用认成已授权,scope 怎么匹配?」、
+「stdio 传输的 JSON-RPC 收发怎么做请求/响应配对(<code>pending map[int]chan</code> + 单 reader goroutine,<a class="cite" href="../../zero/internal/mcp/client.go">client.go:52</a>)?」,
+或者换个大块:「swarm/多 agent 编排的骨架——多个 agent 怎么被拉起、怎么分工、结果怎么汇合?」</div>
+
+<div class="nav">
+  <span>← 第十七课:工具注册与分发</span>
+  <span>外部工具接入的「适配 + 不信任边界」已覆盖。下一步可选:MCP 权限持久化与 scope 匹配 / JSON-RPC 传输层 / swarm 编排骨架</span>
+</div>
+
+<footer>Zero 架构课程 · 第十八课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

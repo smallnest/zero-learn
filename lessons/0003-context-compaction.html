@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第三课 — 上下文压缩:守住模型窗口</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第三课</p>
+<h1>上下文压缩:主动 vs 被动,守住模型窗口</h1>
+
+<p>
+第一课那条「只追加的磁带」有个天生的麻烦:它只会变长。跑上十几个回合、读几个大文件、
+执行几次 shell,<code>messages</code> 迟早撑爆模型的上下文窗口。压缩就是让这条磁带
+不至于爆掉,同时又<strong>不丢近期上下文</strong>的机制。
+</p>
+
+<blockquote>
+对齐 mission:你的目标之一是「解释上下文如何守在窗口内 —— 主动 vs 被动压缩」。
+这一课就交付它,并回到第一课里那两行你当时略过的分支(<code>loop.go:161</code> 和
+<code>:186</code>)。
+</blockquote>
+
+<h2>核心洞察:压缩就是「掐掉中段,留头留尾」</h2>
+<p>
+纯函数 <code>Compact</code> 定义了唯一的形状:
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:166</a>
+</p>
+<pre><code>[system...,  summaryAsUser,  preservedSuffix...]
+   ↑留verbatim   ↑把中段总结成一条user消息   ↑最近N条留verbatim</code></pre>
+<ul>
+<li>开头的 <strong>system 消息原样保留</strong>(系统提示不能丢)。</li>
+<li>最老的<strong>中段</strong>被喂给模型总结成一段散文,注入为<em>一条</em> user 消息,
+带标签 <code>[Summary of earlier conversation]</code>。</li>
+<li>最近 <code>preserveLast</code> 条(默认 <strong>8</strong>)<strong>逐字保留</strong> ——
+近期上下文最关键,绝不总结。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:25</a></li>
+</ul>
+
+<div class="callout">
+<span class="label">一个容易被忽略的正确性细节</span>
+保留后缀的起点会<em>向前推</em>,直到它落在一条 assistant 消息上
+(<code>safeSuffixBoundary</code>,<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:241</a>)。
+因为总结是以 user 角色注入的,若后缀以 tool/user 开头,就会和它形成连续同角色回合 ——
+Anthropic 这类严格 provider 会直接拒绝。压缩必须产出一段合法可重放的对话。
+</div>
+
+<p>
+另外,中段里的<strong>结构化状态</strong>(当前 plan、已加载的 skill)会被原样提取拼进摘要,
+而不是被散文「意译」掉(<code>appendPreservedState</code>,<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:217</a>)。散文会模糊,状态不能模糊。
+</p>
+
+<h2>两个触发时机</h2>
+<p>
+同一个 <code>Compact</code>,被两条路径调用。这正是第一课里那两行分支:
+</p>
+
+<h3>主动(proactive):在发请求<em>之前</em></h3>
+<p>
+每个回合开头,<code>maybeCompact</code> 先估算 <code>messages</code> + 工具定义的 token 数
+(工具定义每次请求都要带上,所以一起算)。一旦超过<strong>阈值 = 窗口 × 0.8</strong>
+就压缩。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:338</a>、
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:29</a>
+</p>
+<p>但它还有两个精妙的省钱/防抖设计:</p>
+<ul>
+<li><strong>先用免费手段。</strong> 先 <code>pruneStaleToolOutput</code> —— 把老的大工具结果
+的正文裁掉(模型早就基于它行动过了),<em>零 token、零延迟</em>。若这一步就压回阈值以下,
+就跳过要花钱的摘要调用。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:366</a></li>
+<li><strong>低水位标记(lowWaterMark)防抖。</strong> 压缩后记下当前大小;只有当历史又<em>涨过</em>
+这个水位、且仍超阈值时才再压。否则一旦贴着阈值,就会每回合都重复总结已压缩过的历史。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:358</a></li>
+</ul>
+
+<h3>被动(reactive):请求<em>失败之后</em></h3>
+<p>
+估算不总是准的 —— 有些 provider 直到你真的发出去才报「上下文超限」。这时
+<code>recover</code> 兜底:如果错误串看起来像上下文超限
+(<code>isContextLimitError</code> 做大小写无关的子串匹配,容忍各家措辞差异,
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:258</a>),
+就压缩一次并<strong>重试同一个回合</strong>。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:400</a>
+</p>
+<p>
+关键护栏:<strong>每次运行最多被动压缩一次</strong>(<code>reactiveAttempted</code>)。否则一个
+压缩后仍反复报超限的 provider 会无限循环。但注意一个考究之处 —— 如果历史太小、压缩其实
+没缩小任何东西,它<em>不</em>消耗这一次性预算(返回「未重试」让原始错误浮现),好让历史
+以后长大了还能再救一次。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:429</a>
+</p>
+
+<h2>回到第一课的循环</h2>
+<p>还记得这两行吗?现在它们有名字了:</p>
+<pre><code>messages = compactor.maybeCompact(ctx, provider, messages, exposed)      // 主动:loop.go:161
+...
+if compacted, retried, _ := compactor.recover(ctx, provider, ...); retried {  // 被动:loop.go:186
+    messages = compacted   // 用压缩后的历史重试本回合
+}</code></pre>
+<p>
+两条路径共用同一个纯 <code>Compact</code>;区别只在<em>时机</em>和<em>触发条件</em>。而且整个
+压缩过程对用户<strong>不可见</strong> —— 摘要调用故意不转发 <code>OnText</code>,但仍转发
+<code>OnUsage</code>,因为它烧的 token 得照常计入用量和预算。
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:319</a>
+</p>
+
+<div class="callout warn">
+<span class="label">为什么这么设计</span>
+压缩是<strong>纯函数 + 两个调用点</strong>:<code>Compact</code> 不做任何 provider I/O,
+只接收一个 <code>Summarize</code> 闭包,失败就原样返回历史、绝不丢消息。把「怎么压」和
+「何时压」分开,让这段最容易出正确性 bug 的逻辑(重放合法性、防无限循环)可以被单元测试
+钉死 —— 这也是为什么 <code>compaction_test.go</code> 有 600+ 行。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">压缩后,一段对话的形状是?</p>
+  <button class="opt">只保留最近 8 条,其余全部丢弃</button>
+  <button class="opt">system 原样 + 中段摘要 + 最近若干条原样</button>
+  <button class="opt">把整段对话总结成一条 system 消息</button>
+  <button class="opt">按时间均匀采样出固定条数</button>
+  <div class="fb"
+    data-correct="对 —— [system…, 摘要as user, 保留后缀…],头尾 verbatim、掐中段(compaction.go:166)。"
+    data-wrong="是 [system…, 中段摘要, 最近N条原样]:留头留尾、总结中段(compaction.go:166)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">主动压缩和被动压缩的本质区别是?</p>
+  <button class="opt">一个用摘要,一个用裁剪,算法不同</button>
+  <button class="opt">一个保留 8 条,一个保留 4 条</button>
+  <button class="opt">时机不同:发请求前估算触发 vs 请求失败后兜底</button>
+  <button class="opt">一个在 TUI,一个在 headless</button>
+  <div class="fb"
+    data-correct="对 —— 共用同一个 Compact;主动在回合开头按阈值(窗口×0.8)触发,被动在 context-limit 报错后重试一次。"
+    data-wrong="两者共用 Compact,区别在时机:主动=请求前按阈值,被动=失败后兜底一次(loop.go:161 / :186)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">为什么保留后缀的边界要「向前推到 assistant 消息」?</p>
+  <button class="opt">摘要是 user 角色,后缀若以 user/tool 开头会违反严格 provider 的角色交替</button>
+  <button class="opt">assistant 消息 token 更少</button>
+  <button class="opt">为了让 TUI 高亮更好看</button>
+  <button class="opt">assistant 消息一定包含工具调用</button>
+  <div class="fb"
+    data-correct="对 —— 保证压缩产物是一段合法可重放的对话,不出现连续同角色回合(compaction.go:241)。"
+    data-wrong="因为摘要以 user 注入,后缀须落在 assistant 上以维持角色交替,否则严格 provider 拒绝(compaction.go:241)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +166 ../zero/internal/agent/compaction.go   # Compact 纯函数:形状
+less +338 ../zero/internal/agent/compaction.go   # maybeCompact 主动 + 省钱/防抖
+less +400 ../zero/internal/agent/compaction.go   # recover 被动 + 一次性预算</code></pre>
+<p>
+读的时候抓三个词:<strong>阈值</strong>(窗口×0.8)、<strong>lowWaterMark</strong>(防每回合重压)、
+<strong>reactiveAttempted</strong>(防无限重试)。这三个数字/标志就是整套策略。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>pruneStaleToolOutput</code> 具体裁掉什么、怎么判断哪些工具结果算『陈旧』?」、
+「token 是怎么估算的(<code>estimateTokens</code>)?」,或者
+「摘要那次 provider 调用为什么要 tool-less?」
+</div>
+
+<div class="nav">
+  <span>← 第二课:executeToolCall</span>
+  <span>下一课:第四课 —— 护栏:让循环不至于失控(runaway/空回合/重复失败)→</span>
+</div>
+
+<footer>Zero 架构课程 · 第三课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

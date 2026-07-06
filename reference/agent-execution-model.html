@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>速查 — Zero Agent 执行模型</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  td code { font-size: 0.8em; }
+  .step { font-family: ui-monospace, monospace; color: var(--accent); white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 速查卡</p>
+<h1>Agent 执行模型速查</h1>
+<p>覆盖第一、二课。所有引用指向 <code>github.com/Gitlawb/zero</code> 源码。</p>
+
+<h2>一、主循环 <code>Run</code>(对回合的 fold)</h2>
+<p>文件:<code>internal/agent/loop.go:107</code>,默认 <code>maxTurns = 12</code>。</p>
+<table>
+<tr><th>步</th><th>动作</th><th>位置</th></tr>
+<tr><td class="step">seed</td><td>系统提示 + 用户 prompt(+图片)构成初始 <code>messages</code>(只追加的磁带)</td><td><code>:130</code></td></tr>
+<tr><td class="step">for turn</td><td>回合循环,上限 <code>maxTurns</code></td><td><code>:149</code></td></tr>
+<tr><td class="step">partition</td><td><code>partitionTools</code>:决定本回合暴露哪些工具</td><td><code>:156</code></td></tr>
+<tr><td class="step">compact</td><td>主动压缩:逼近窗口时先总结最老的中段</td><td><code>:161</code></td></tr>
+<tr><td class="step">stream</td><td><code>streamWithReconnect</code> → <code>Provider.StreamCompletion</code></td><td><code>:178</code></td></tr>
+<tr><td class="step">collect</td><td><code>CollectStreamWithOptions</code> 抽干成 <code>Text</code> + <code>ToolCalls</code></td><td><code>:273</code></td></tr>
+<tr><td class="step">append</td><td>把 assistant 回复写入 <code>messages</code></td><td><code>:348</code></td></tr>
+<tr><td class="step">分叉</td><td><code>len(ToolCalls)==0</code> → <strong>返回最终答案(出口)</strong></td><td><code>:357 / :453</code></td></tr>
+<tr><td class="step">执行</td><td>否则逐个 <code>executeToolCall</code>,每个 append 一条 tool 消息,继续下一回合</td><td><code>:478 / :495</code></td></tr>
+<tr><td class="step">天花板</td><td>触到 <code>maxTurns</code> = 半途截断,循环后单独处理</td><td><code>:628</code></td></tr>
+</table>
+
+<p><strong>不变量:</strong>每个已声明的工具调用都恰有一条 tool 结果消息;护栏中途叫停也会回填「已中止」占位(<code>:509</code>),保证严格 provider 重放有效。</p>
+
+<h2>二、核心接缝:<code>Provider</code></h2>
+<pre><code>type Provider interface {                                  // types.go:209
+    StreamCompletion(ctx, request) (&lt;-chan StreamEvent, error)
+}</code></pre>
+<p>唯一方法。循环只讲 <code>StreamEvent</code>,从不点名厂商 —— 这是支持 25+ provider 的原因。</p>
+
+<h2>三、工具与权限</h2>
+<pre><code>type Tool interface {         // tools/types.go:119
+    Name() / Description() / Parameters() / Safety() / Run(ctx, args)
+}</code></pre>
+<p>工具只用 <code>Safety()</code> 声明危险等级,不做执行检查。三值权限(<code>tools/types.go:32</code>):</p>
+<table>
+<tr><th>值</th><th>含义</th><th>例</th></tr>
+<tr><td><code>PermissionAllow</code></td><td>直接放行</td><td>读文件、grep、glob</td></tr>
+<tr><td><code>PermissionPrompt</code></td><td>需问用户</td><td>写文件、跑 shell</td></tr>
+<tr><td><code>PermissionDeny</code></td><td>默认拒绝</td><td>—</td></tr>
+</table>
+<p>可选 <code>ArgsPermissioner</code>:权限随<em>参数</em>变化(<code>loop.go:1665</code>),故 <code>ls</code> 放行、<code>rm -rf</code> 询问。</p>
+
+<h2>四、<code>executeToolCall</code> 的七道关卡</h2>
+<p>文件:<code>loop.go:774</code>。任一关都可能提前返回,使 <code>Run</code> 不被执行。</p>
+<table>
+<tr><th>#</th><th>关卡</th><th>位置</th></tr>
+<tr><td>①</td><td>参数解码(失败即让模型重试)</td><td><code>:776</code></td></tr>
+<tr><td>②</td><td>启用/禁用名单过滤(<code>tool_search</code> 豁免)</td><td><code>:791</code></td></tr>
+<tr><td>③</td><td><code>PrePermissionRejecter</code> 否决 + 拦截 <code>ask_user</code>/<code>request_permissions</code></td><td><code>:811 / :822</code></td></tr>
+<tr><td>④</td><td>授权基线:unsafe 模式 / <code>Allow</code> / 命中命令前缀授权</td><td><code>:829</code></td></tr>
+<tr><td>⑤</td><td>沙箱预评估 <code>Sandbox.Evaluate → Decision</code></td><td><code>:859</code></td></tr>
+<tr><td>⑥</td><td><code>shouldRequestPermission</code> → 弹窗;大 <code>switch</code> 处理 允许/会话/前缀/永久/取消/拒绝 + 授予附加权限作用域</td><td><code>:865 / :1672</code></td></tr>
+<tr><td>⑦</td><td><code>beforeTool</code> 钩子否决(非零退出即阻断)</td><td><code>:1002</code></td></tr>
+<tr><td>▶</td><td><strong>执行</strong> <code>registry.RunWithOptions</code></td><td><code>:1021</code></td></tr>
+<tr><td>后1</td><td>沙箱受限重试(带网/无沙箱重试一次)</td><td><code>:1043</code></td></tr>
+<tr><td>后2</td><td><code>afterTool</code> 钩子结果拼回给模型</td><td><code>:1070</code></td></tr>
+<tr><td>后3</td><td>密钥擦除(registry 边界统一脱敏)</td><td><code>:1079</code></td></tr>
+</table>
+
+<p class="ask"><strong>心智锚:</strong>Run 是纯机制;executeToolCall 是策略。关卡在工具<em>外</em>,新工具没有能力绕过检查。</p>
+
+<div class="nav">
+  <span><a href="../lessons/0001-the-agent-loop.html">第一课</a> · <a href="../lessons/0002-execute-tool-call.html">第二课</a></span>
+  <span>速查卡会随课程增补</span>
+</div>
+
+<footer>Zero 架构课程 · 速查卡 · 基于源码</footer>
+</body>
+</html>

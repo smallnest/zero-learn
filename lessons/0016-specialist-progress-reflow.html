@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十六课 — specialist 进度回流:一条实时管道 + 一条持久账本,喂同一张卡片</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十六课</p>
+<h1>子会话怎么把进度「实时」回流到父会话那张卡片</h1>
+
+<p>
+第十五课把 specialist 子会话<em>挂</em>到父会话上(<code>EventSessionChild</code> 双向书签)。这一课接着问:
+子 agent 跑起来后,它的进度 —— 调了几次工具、烧了多少 token、成功还是失败 —— 怎么<strong>实时</strong>爬回到父会话 TUI 里那张
+specialist 卡片上?答案是<strong>两条截然不同的通道</strong>喂同一张卡片,新手最容易只看到一条。
+</p>
+
+<blockquote>
+对齐 mission:一个能派 sub-agent(Task 工具 / swarm 成员)的 coding agent,父这边不能变成黑盒 ——
+用户得看见「worker 正在读 <code>foo.go</code>、已 12 次工具调用、1,840 tokens」。但子会话是<em>另一个进程</em>,
+它的进度既要<strong>当场</strong>滚动给用户看,又要在<strong>重启/resume 后</strong>还能重建。一条管道满足不了这两个需求,
+所以 Zero 用了两条 —— 看懂它俩的分工,就看懂了「实时」与「持久」在 agent 里的边界。
+</blockquote>
+
+<h2>两条通道一句话对照</h2>
+<table style="border-collapse:collapse;width:100%;font-size:0.85rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)"></th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">实时管道</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">持久账本</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">载体</td><td style="padding:.3rem .5rem">子进程 stdout 的 stream-json</td><td style="padding:.3rem .5rem">父会话日志里的事件</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">粒度</td><td style="padding:.3rem .5rem">每一次工具调用都滚</td><td style="padding:.3rem .5rem">只记 start / stop / usage</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">存活</td><td style="padding:.3rem .5rem">进程内,重启即失</td><td style="padding:.3rem .5rem">落盘,resume 可重建</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">显示</td><td style="padding:.3rem .5rem">↳ 当前工具 + 计数递增</td><td style="padding:.3rem .5rem">卡片的最终状态与用量</td></tr>
+<tr><td style="padding:.3rem .5rem">键</td><td style="padding:.3rem .5rem"><code>toolCallId</code>(子还没 id)</td><td style="padding:.3rem .5rem"><code>childSessionId</code></td></tr>
+</table>
+
+<h2>实时管道:一条事件穿五层,从子进程 stdout 到父卡片</h2>
+<p>
+子会话是被 <code>--output-format stream-json</code> 拉起的独立进程
+<a class="cite" href="../../zero/internal/specialist/exec.go">exec.go:257</a>。它每吐一行 JSON,父这边就接力传一次:
+</p>
+<pre><code>子进程 stdout ──每行──► runChildProcess 解析 ──► progress(event)         // exec.go:799
+   └► Task 工具的 Progress                                              // task_tool.go:110
+      └► loop 里只给 Task 装的 progressCallback(带上 toolCallID)        // loop.go:1013
+         └► options.OnToolProgress(toolCallID, event)                   // model.go:4377
+            └► runtimeMessageSink(specialistProgressMsg{…})  → tea.Msg   // model.go:4379</code></pre>
+<p>
+最后这条 <code>specialistProgressMsg</code> 进 TUI 的 <code>Update</code>
+<a class="cite" href="../../zero/internal/tui/model.go">model.go:1992</a>,只做两件事:给卡片的工具计数 <code>+1</code>
+(<code>incrementToolCount</code> <a class="cite" href="../../zero/internal/tui/model.go">:2000</a>)、更新「↳ 正在 read_file foo.go」这行实时预览
+(<code>setCurrentTool</code> <a class="cite" href="../../zero/internal/tui/model.go">:2001</a>)。这条链正是第六课「回调 → <code>tea.Msg</code> → Elm 循环」
+在子会话上的延伸 —— 只不过源头从本地 agent 换成了<em>另一个进程的 stdout</em>。
+</p>
+<div class="callout">
+<span class="label">为什么只有 Task 工具、且只认 tool_call 事件</span>
+<code>progressCallback</code> <strong>仅当</strong> <code>call.Name == "Task"</code> 时才装配
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:1013</a>;而 <code>OnToolProgress</code> 里又<strong>只对</strong>
+<code>EventToolCall</code> 发 <code>specialistProgressMsg</code> <a class="cite" href="../../zero/internal/tui/model.go">model.go:4378</a>。
+于是卡片计的是子 agent 的<em>工具调用</em>数,而不是它的碎碎念(text/reasoning)—— 因为「调了几次工具」才是「进度」的有意义单位。
+</div>
+
+<h2>一个巧思:卡片先用「临时键」出生,完成时才认领真身</h2>
+<p>
+难点在于:实时管道启动时,子进程<em>还没创建</em>自己的 session id —— 那个 id 要等子进程跑起来才知道。
+所以卡片一出生就先用 <strong>Task 的 <code>toolCallId</code></strong> 当键(<code>start</code>
+<a class="cite" href="../../zero/internal/tui/specialist_card.go">specialist_card.go:54</a>),期间所有进度也都按 toolCallId 累加。
+等子会话完成、真 id 回来了,<code>specialistCompleteMsg</code> 再做一次<strong>身份认领</strong>:
+</p>
+<pre><code>m.specialists.complete(msg.toolCallID, …)                        // 先按临时键结算 model.go:1976
+if msg.childSessionID != "" && msg.childSessionID != msg.toolCallID {
+    m.specialists.reconcileSessionID(msg.toolCallID, msg.childSessionID) // 改键 :1978
+}</code></pre>
+<p>
+<code>reconcileSessionID</code> <a class="cite" href="../../zero/internal/tui/specialist_card.go">specialist_card.go:134</a>
+把这条卡片的键从 toolCallId 改写成真正的 childSessionId —— 这样用户之后<em>点开</em>卡片钻进子会话
+(subchat)时,才能拿真 id 去 store 里找到子会话的事件。<strong>临时键让卡片能立刻显示,真身键让它事后可导航。</strong>
+</p>
+
+<h2>持久账本:进度事件写进<em>父</em>会话的日志,不是子的</h2>
+<p>
+实时管道一断电就没了。要让 resume 之后卡片还能重建,得把里程碑落盘 —— 而且刻意落在<strong>父会话</strong>的日志里:
+<code>recordSpecialistStart</code> <a class="cite" href="../../zero/internal/specialist/accounting.go">accounting.go:36</a> /
+<code>recordSpecialistStop</code> <a class="cite" href="../../zero/internal/specialist/accounting.go">:41</a> 各写一条
+<code>EventSpecialistStart</code>/<code>EventSpecialistStop</code> 到 <code>ParentSessionID</code>。
+子会话有它<em>自己</em>那份完整 events.jsonl(第七课),父这边只需要一张<em>摘要卡</em>。
+resume 时,<code>session.go</code> 顺父日志重放:见 Start 渲一张卡
+<a class="cite" href="../../zero/internal/tui/session.go">session.go:468</a>,见 Stop 就<em>就地更新同一张卡</em>而不是再加一张
+<a class="cite" href="../../zero/internal/tui/session.go">:473</a> —— 与实时管道的「临时键→认领」是同一种「一个子会话只有一张卡」的纪律。
+</p>
+<div class="callout">
+<span class="label">用量是「卷总」一条,不是逐条搬运 —— 又见非幂等纪律</span>
+子会话烧的 token 不逐条搬进父日志,而是 <code>rollUpSpecialistUsage</code>
+<a class="cite" href="../../zero/internal/specialist/accounting.go">accounting.go:63</a> 把整个子运行的用量<strong>聚合成一条</strong> <code>EventUsage</code> 记到父头上。
+这正是第十五课 Fork 跳过 usage、第十/十二课「非幂等不重放」在<em>账</em>上的第三次回响:同一份 token 只能算一次。
+</div>
+
+<h2>最硬的一处:跨进程的「只记一次」</h2>
+<p>
+麻烦在于 stop/usage 可能被<strong>多个路径同时</strong>写:前台 <code>onExit</code> 可能和一次 <code>TaskOutput</code> 轮询、
+或另一个进程里的 background reaper 撞在一起。一个朴素的「先查有没有、没有再写」会漏 —— 两个都查到「没有」,于是各写一条,用量翻倍。
+Zero 的解法是把检查和追加<strong>原子化</strong>:
+</p>
+<pre><code>appendSpecialistEventOnce(…)                                     // accounting.go:160
+  └► store.AppendEventUnlessExists(parent, event, matcher)       // 锁内 check+append :166</code></pre>
+<div class="callout warn">
+<span class="label">进程内的 mutex 兜不住跨进程的竞争</span>
+<code>accountingMu</code> <a class="cite" href="../../zero/internal/specialist/accounting.go">accounting.go:23</a> 只是<em>进程内</em>的快路径;
+真正的去重保证来自 <code>AppendEventUnlessExists</code> —— 它在 session 锁(进程内 mutex + <strong>跨进程文件锁</strong>)下把
+「存在性检查」和「追加」合成一个原子操作。因为竞争方可能在<em>另一个进程</em>(background 任务),
+只有落到<em>文件锁</em>这一层才关得住。matcher(<a class="cite" href="../../zero/internal/specialist/accounting.go">:120</a>)按
+<code>childSessionId</code>+<code>runId</code> 认「同一次」,还带一条 catch-all:没 runId 的早期 stop 能和后来带 runId 的匹配上,免得同一个子会话记两条。
+</div>
+
+<h2>合起来看:实时是「派生视图」,持久是「真相」</h2>
+<p>
+卡片(<code>specialistTracker</code>)这个内存状态,同时被两条通道喂:实时管道给它滚动的 ↳ 预览和递增计数,持久账本给它最终状态和用量。
+这与第七课的骨架一脉相承 —— <strong>事件日志是真相,TUI 状态是派生</strong>。实时管道只是架在持久真相之上的一层<em>加速视图</em>,
+让用户不必等落盘就能看见进度;而真正能扛住重启的,永远是那几条写进父日志的事件。
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">子会话进度用<em>两条</em>通道回流父卡片,它们的根本分工是什么?</p>
+  <button class="opt">实时管道负责计费用量准确落盘,持久账本负责滚动显示当前工具进度</button>
+  <button class="opt">两条通道都实时滚动进度,区别仅在于各自连接的是不同的子会话进程</button>
+  <button class="opt">实时管道当场滚动进度但断电即失,持久账本落盘里程碑供重启后重建</button>
+  <button class="opt">实时管道处理前台任务的进度,持久账本专门处理后台任务的进度回流</button>
+  <div class="fb"
+    data-correct="对 —— 实时管道走子进程 stdout,每次工具调用都滚、进程内、重启即失;持久账本把 start/stop/usage 写进父日志,落盘、resume 可重建(model.go:1992 / accounting.go:36)。"
+    data-wrong="实时管道=stdout 逐工具调用滚动、进程内易失;持久账本=父日志里的 start/stop/usage、落盘可重建。一个求实时,一个求持久(accounting.go:36)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">实时管道启动时,卡片为什么先用 <code>toolCallId</code> 当键、事后再改?</p>
+  <button class="opt">子进程启动时其真实会话 id 尚未创建,完成时才认领真身以便钻取</button>
+  <button class="opt">因为工具调用 id 比会话 id 更短,用作哈希查找键时性能明显更优</button>
+  <button class="opt">因为同一个父会话里允许多个子会话共享复用同一个真实会话 id 值</button>
+  <button class="opt">因为会话 id 属于敏感信息,启动阶段必须先用临时键做脱敏的处理</button>
+  <div class="fb"
+    data-correct="对 —— 子进程还没创建自己的 session id,卡片先用 toolCallId 出生;完成时 reconcileSessionID 改成真 id,用户点开卡片才能按真 id 找到子会话事件(specialist_card.go:134)。"
+    data-wrong="真 session id 要等子进程跑起来才知道,故先用 toolCallId 当临时键;完成时 reconcileSessionID 认领真身,让 subchat 能按真 id 导航(model.go:1978)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么进程内的 <code>accountingMu</code> 兜不住 stop/usage 的重复写?</p>
+  <button class="opt">因为该互斥锁在获取时会超时释放,导致并发写入之间出现竞争窗口</button>
+  <button class="opt">竞争方可能在另一个进程,只有会话文件锁下的原子 check+append 才关得住</button>
+  <button class="opt">因为互斥锁只保护读取路径,而对事件的追加写入路径完全不加保护</button>
+  <button class="opt">因为用量事件的体积超过了单次原子写入所能容纳的最大字节上限</button>
+  <div class="fb"
+    data-correct="对 —— 前台 onExit 可能和另一个进程的 background reaper 撞车;accountingMu 只是进程内快路径,真正去重靠 AppendEventUnlessExists 在文件锁下把 check+append 原子化(accounting.go:23)。"
+    data-wrong="竞争方可能跨进程(background 任务),进程内 mutex 管不到;必须靠 AppendEventUnlessExists 在会话文件锁下原子 check+append(accounting.go:166)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +799  ../zero/internal/specialist/exec.go          # runChildProcess:读子进程 stdout,每行 progress(event)
+less +1013 ../zero/internal/agent/loop.go               # progressCallback:只给 Task 装、绑定 toolCallID
+less +4377 ../zero/internal/tui/model.go                # OnToolProgress → specialistProgressMsg(只认 tool_call)
+less +134  ../zero/internal/tui/specialist_card.go       # reconcileSessionID:临时键→真 id 认领
+less +36   ../zero/internal/specialist/accounting.go     # recordStart/Stop + rollUpUsage:写进父日志
+less +160  ../zero/internal/specialist/accounting.go     # appendSpecialistEventOnce:锁内原子 check+append</code></pre>
+<p>
+读的顺序:先顺实时管道走一遍那五层接力(exec.go:799 → loop.go:1013 → model.go:4377),体会「一条 stdout 事件怎么变成一次 <code>tea.Msg</code>」。
+再看 <code>reconcileSessionID</code> 的临时键把戏。最后啃 <code>accounting.go</code> 的持久侧 —— 尤其
+<code>appendSpecialistEventOnce</code> 那段注释,它把「为什么进程内锁不够、必须文件锁原子化」讲得很透。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「background specialist(独立进程、无 stdout 回传给父 TUI)的进度靠什么回流 —— <code>TaskOutput</code> 轮询 + <code>recordBackgroundTaskAccounting</code>(<a class="cite" href="../../zero/internal/specialist/accounting.go">accounting.go:68</a>)是怎么补上实时管道缺席的?」、
+「swarm 成员(<code>MemberAutonomy</code>)和 Task specialist 在权限/自治级别上差在哪(<code>memberAwareAutonomy</code>)?」,
+或者换个方向:「压缩恢复的触发判定 —— <code>compactor.recover</code> 怎么认出上下文超限、又怎么保证只压一次?」</div>
+
+<div class="nav">
+  <span>← 第十五课:会话分叉 vs 子会话</span>
+  <span>子会话进度的「实时 + 持久」双通道已覆盖。下一步可选:background 进度轮询 / swarm 成员自治 / 压缩恢复触发判定</span>
+</div>
+
+<footer>Zero 架构课程 · 第十六课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

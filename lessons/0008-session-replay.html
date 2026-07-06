@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第八课 — 会话回放:把事件日志重新塌缩成一条磁带</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第八课</p>
+<h1>会话回放:<code>/resume</code> 的另一半 —— 塌缩压缩、而非照搬</h1>
+
+<p>
+第七课说 <code>/resume</code> 就是「读回 <code>events.jsonl</code>、重放成对话」。但那句话藏了一个陷阱:
+如果一次长会话中途做过<strong>压缩</strong>(第三课),日志里既留着<em>被压缩掉的原始老事件</em>,
+又留着<em>那条摘要</em>。天真地全部重放,等于把当初省下的几千 token 又<strong>原样倒回</strong>上下文 ——
+压缩白做了。这一课讲 <code>replay.go</code> 怎么优雅地避开它。
+</p>
+
+<blockquote>
+对齐 mission:第三课的压缩是<em>内存里</em>的即时行为;而一次能被 <code>/resume</code> 的会话必须把
+「我压缩过」这件事<strong>持久化</strong>下来,并让回放<em>尊重</em>它。这一课就是压缩的持久面。
+</blockquote>
+
+<h2>核心洞察:回放 = 找到最后一次压缩,用摘要替换它盖住的老事件</h2>
+<p>
+入口 <code>RehydrateEvents</code> 出奇地简单 —— <strong>从日志末尾往前找第一个(即最后发生的)
+<code>EventCompaction</code></strong>:
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:233</a>
+</p>
+<pre><code>for i := len(events) - 1; i >= 0; i-- {
+    if events[i].Type != EventCompaction { continue }
+    return rehydrateEventsWithCompaction(events, events[i], payload), nil  // ← 命中即返回
+}
+return cloneEvents(events), nil   // 从未压缩过 → 原样重放</code></pre>
+<div class="callout">
+<span class="label">为什么只认「最后一次」</span>
+压缩是<strong>累积</strong>的:一次新压缩会把「上次的摘要 + 之后的新事件」再总结成一条更新的摘要。
+所以最新那条压缩事件<em>已经涵盖</em>了它之前的所有历史 —— 只需处理它一个,前面的压缩自动被
+它的覆盖范围吸收。从尾往前扫、命中即停,就是这个道理。
+</div>
+
+<h2>塌缩的机制:跳过 + 就地插入一次摘要</h2>
+<p>
+<code>rehydrateEventsWithCompaction</code> 顺序走一遍事件,做三件事:
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:262</a>
+</p>
+<ul>
+<li>被这次压缩<strong>盖住的老事件</strong> → 跳过;</li>
+<li>在<strong>第一个被跳过的位置</strong>,把摘要事件<em>插入一次</em>(<code>insertedSummary</code> 标志保证只插一次);</li>
+<li>压缩事件<strong>自己在日志尾部的原始位置被丢弃</strong>(<code>event.ID == compaction.ID</code> 时 continue),
+它只以「插在老事件那个位置」的身份出现一次。</li>
+</ul>
+<p>
+结果和第三课内存里 <code>Compact</code> 的形状<strong>一模一样</strong>:
+<code>[摘要一条, 保留的近期事件...]</code>。同一套心智模型,一个在内存、一个在持久层。
+</p>
+
+<div class="callout">
+<span class="label">「盖住了哪些」的两种判定 —— 向前兼容</span>
+判断一个事件是否被压缩盖住,优先用摘要载荷里<strong>显式记录的事件 ID 集合</strong>
+(<code>CompactableEvents</code>);当这个集合为空(更老/更精简的载荷没存 ID),就<strong>回退到
+序列号截止</strong>:<code>Sequence ≤ CompactedThroughSequence</code> 即视为被盖住。
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:269</a>
+两种判据让回放能读懂不同年代写下的压缩事件 —— 日志格式演进了,老会话仍能 resume。
+</div>
+
+<h2>「计划」模式:先算清楚,再落笔</h2>
+<p>
+压缩和倒带都遵循同一个手法:先产出一个纯粹、可检视的<strong>计划对象</strong>,再据此执行。
+<code>PlanCompaction</code>
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:145</a> 就是第三课那条规则的持久版:
+</p>
+<pre><code>split := len(events) - preserveLast   // preserveLast 默认 8 —— 和第三课同一个数
+compactable := events[:split]         // 老的中段:要总结
+preserved   := events[split:]         // 近期:逐字保留
+prompt, truncated := buildCompactionPrompt(compactable, maxPromptChars)</code></pre>
+<p>
+<code>PlanRewind</code>(<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:77</a>)同理:
+它先算出 <code>KeptEvents</code> / <code>DroppedEvents</code> 两张清单(可选 <code>KeepTarget</code> 决定目标事件本身留不留),
+让调用方<em>先看清</em>「倒带会丢什么」,再决定要不要真的 <code>ApplyRewind</code>(第七课)。
+<strong>决策与执行分离</strong> —— 这让最容易出正确性 bug 的逻辑可以被单元测试钉死,也让 UI 能先给用户一个预览。
+</p>
+
+<h2>做摘要 prompt 时:塑形 + 脱敏 + 限长</h2>
+<p>
+<code>buildCompactionPrompt</code> 把每个待压缩事件转成一行喂给模型,但绝不原样倒进去
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:298</a>:
+</p>
+<ul>
+<li><strong>按类型塑形(<code>shapedPayloadPreview</code>)</strong>:工具调用只留 <code>id/name</code>、权限事件只留
+<code>action/risk</code> 等白名单字段,其余丢弃 —— 摘要不需要完整载荷。
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:319</a></li>
+<li><strong>脱敏</strong>:每段预览都过 <code>redaction.RedactString</code>,和第二课工具结果在 registry 边界统一
+擦密钥呼应 —— 密钥不该混进摘要,更不该被写回日志或发给 provider。
+<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:373</a></li>
+<li><strong>限长</strong>:整个 prompt 超 8000 字符就在 rune 边界安全截断并标 <code>[truncated]</code>,
+不产生非法 UTF-8。<a class="cite" href="../../zero/internal/sessions/replay.go">replay.go:382</a></li>
+</ul>
+
+<div class="callout warn">
+<span class="label">三课在此合流</span>
+<strong>第一课</strong>:内存里那条只追加的 <code>messages</code> 磁带。<strong>第七课</strong>:把它落盘成
+只追加的 <code>events.jsonl</code>。<strong>本课</strong>:把日志<em>回放</em>成一条磁带 —— 但回放不是逆操作,
+它要<strong>尊重压缩</strong>(第三课),否则 resume 会撤销掉当初的省钱。持久化不是简单的「存了再读」;
+存的是<em>事件</em>,读的是<em>塌缩后的派生状态</em>。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">回放时,为什么只需处理日志里「最后一次」压缩事件?</p>
+  <button class="opt">因为只有最后一次才写了摘要,之前的都是空的</button>
+  <button class="opt">压缩是累积的,最新那次已涵盖它之前的全部历史</button>
+  <button class="opt">provider 只接受一条摘要消息</button>
+  <button class="opt">为了节省从头扫描的时间</button>
+  <div class="fb"
+    data-correct="对 —— 新压缩把『旧摘要+新事件』再总结,故最新一条覆盖此前所有;从尾往前扫、命中即停(replay.go:233)。"
+    data-wrong="因为压缩累积:最新那条摘要已吸收之前全部历史,处理它一个即可(replay.go:233)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">如果天真地把 events.jsonl 全部原样重放会怎样?</p>
+  <button class="opt">会丢失最近的对话</button>
+  <button class="opt">会违反 provider 的角色交替规则</button>
+  <button class="opt">被压缩省下的老事件又倒回上下文,压缩白做</button>
+  <button class="opt">工作区文件会被错误回滚</button>
+  <div class="fb"
+    data-correct="对 —— 日志里老事件和摘要并存,全放=把省下的 token 倒回;回放须用摘要替换被盖住的老事件(replay.go:262)。"
+    data-wrong="老事件与摘要并存,全量重放会把压缩省下的历史倒回上下文;正解是塌缩掉被盖住的老事件(replay.go:262)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">判断一个事件是否被某次压缩「盖住」,回放用什么依据?</p>
+  <button class="opt">优先用摘要载荷里的显式事件 ID 集合,缺失则回退到序列号截止</button>
+  <button class="opt">只看事件的 CreatedAt 时间戳早晚</button>
+  <button class="opt">看事件类型是否为 message</button>
+  <button class="opt">重新计算每个事件的 sha256 比对</button>
+  <div class="fb"
+    data-correct="对 —— 先用 CompactableEvents 的 ID 集合;为空则按 Sequence ≤ CompactedThroughSequence,兼容老格式(replay.go:269)。"
+    data-wrong="优先显式 ID 集合,缺失时回退到序列号截止;双判据向前兼容不同年代的压缩载荷(replay.go:269)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +233 ../zero/internal/sessions/replay.go   # RehydrateEvents:从尾找最后一次压缩
+less +262 ../zero/internal/sessions/replay.go   # rehydrateEventsWithCompaction:跳过+插一次摘要
+less +145 ../zero/internal/sessions/replay.go   # PlanCompaction:preserveLast=8,和第三课同源
+less +298 ../zero/internal/sessions/replay.go   # buildCompactionPrompt:塑形+脱敏+限长</code></pre>
+<p>
+读的顺序:先看 <code>RehydrateEvents</code> 那个「从尾往前找压缩」的短循环,理解「只认最后一次」;
+再看 <code>rehydrateEventsWithCompaction</code> 的 skip-set + 只插一次摘要;最后把 <code>PlanCompaction</code>
+和第三课的 <code>Compact</code> 并排看 —— 你会发现 <code>preserveLast=8</code>、「留头留尾掐中段」是同一套设计,
+只是一个作用于内存磁带、一个作用于持久事件流。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「内存压缩(第三课 <code>Compact</code>)和持久压缩(<code>RecordCompaction</code>)是谁触发谁、怎么保持一致的?」、
+「会话锁的两层(进程内 mutex + <code>filelock_unix.go</code> 文件锁)各防什么并发?」,
+或者「<code>EventSessionFork</code> / <code>EventSessionChild</code> 怎么支撑 specialist 子会话和 <code>/fork</code>?」
+</div>
+
+<div class="nav">
+  <span>← 第七课:会话持久化</span>
+  <span>持久化三部曲(日志 / 快照倒带 / 回放)完。下一步可选:Provider 适配层 / 沙箱引擎 / 会话分叉与子会话</span>
+</div>
+
+<footer>Zero 架构课程 · 第八课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十五课 — 会话分叉 vs 子会话:一条历史「复制」出去,一条 sub-任务「挂」上来</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十五课</p>
+<h1>Fork 与 Child:一个会话怎么生出另一个会话</h1>
+
+<p>
+第七课把会话确立为一条 <strong>事件溯源的 <code>events.jsonl</code> 日志</strong>。这一课看它怎么<em>繁殖</em> —— 一个会话变成两个。
+Zero 有两条截然不同的路径,新手最容易把它们混为一谈,但结构上南辕北辙:
+<code>Fork</code>(<code>/fork</code>,<a class="cite" href="../../zero/internal/sessions/store.go">store.go:390</a>)
+和 <code>CreateChild</code>(specialist 子会话,<a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:9</a>)。
+</p>
+
+<blockquote>
+对齐 mission:一个现代 coding agent 有两种「再开一个会话」的需求。① 我想<em>从某个时刻岔开</em>试另一条路,又不弄脏原来的对话 —— 这是 fork。
+② 我想派一个 specialist 子 agent 去干一个 sub-任务(并行探索、swarm 成员),干完把结果带回来 —— 这是 child。
+一条是<strong>复制历史后分岔</strong>,一条是<strong>挂一条全新的 sub-会话上来</strong>。看清这个区别,就看懂了 agent 的会话拓扑。</blockquote>
+
+<h2>一句话对照</h2>
+<table style="border-collapse:collapse;width:100%;font-size:0.86rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)"></th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">Fork(/fork)</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">Child(specialist)</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">意图</td><td style="padding:.3rem .5rem">从某时刻岔开重走</td><td style="padding:.3rem .5rem">派子 agent 干 sub-任务</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">父历史</td><td style="padding:.3rem .5rem"><strong>整段复制</strong>进新会话</td><td style="padding:.3rem .5rem"><strong>不复制</strong>,子会话从空起</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">SessionKind</td><td style="padding:.3rem .5rem"><code>fork</code> <a class="cite" href="../../zero/internal/sessions/store.go">:416</a></td><td style="padding:.3rem .5rem"><code>child</code> <a class="cite" href="../../zero/internal/sessions/lineage.go">:31</a></td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">链接事件</td><td style="padding:.3rem .5rem">只在 fork 自己写一条 <a class="cite" href="../../zero/internal/sessions/store.go">:450</a></td><td style="padding:.3rem .5rem"><strong>父、子各写一条</strong> <a class="cite" href="../../zero/internal/sessions/lineage.go">:50,:53</a></td></tr>
+<tr><td style="padding:.3rem .5rem">关系导航</td><td style="padding:.3rem .5rem">岔开后基本独立</td><td style="padding:.3rem .5rem">进 Lineage/Tree 树</td></tr>
+</table>
+
+<h2>Fork:把历史复制一份,然后各走各的</h2>
+<p>
+<code>Fork</code> 读出父会话的<em>全部</em>事件,逐条 <code>AppendEvent</code> 进新会话
+<a class="cite" href="../../zero/internal/sessions/store.go">store.go:430</a> —— fork 拿到一份<strong>完整的对话历史副本</strong>,再从那里继续。
+两个考究之处:
+</p>
+<ul>
+<li><strong>唯独不复制 usage 事件</strong> <a class="cite" href="../../zero/internal/sessions/store.go">store.go:435</a>:token 用量已经算在父会话头上,若 fork 也带着,一份聚合用量报告就会<em>重复计费</em>。fork 只要对话历史能续上,用量不重放。<em>(这正是第十、十二课那条「非幂等 / 不重复计费」纪律在会话层的回响。)</em></li>
+<li><strong>连内容寻址的 checkpoint blob 也一并拷贝</strong> <a class="cite" href="../../zero/internal/sessions/store.go">store.go:447</a>:否则复制过来的 <code>EventSessionCheckpoint</code> 事件(第七课)会指向不存在的 blob,fork 上做 <code>/rewind</code> 就读到空、悄悄跳过文件。拷了 blob,fork 的时间旅行才完整。</li>
+</ul>
+<p>
+最后在 fork 自己的日志里写一条 <code>EventSessionFork</code>
+<a class="cite" href="../../zero/internal/sessions/store.go">store.go:450</a>,记下「从父会话哪个事件、第几号序列岔开」。fork 之后,两条时间线基本独立演进。
+</p>
+
+<h2>Child:不抄历史,而是在<em>父子两端各钉一个书签</em></h2>
+<p>
+<code>CreateChild</code> 反过来 —— 子会话<strong>不</strong>继承父的对话,它带着自己的 prompt 从头开始干活(它是个 specialist)。
+它要解决的是另一个问题:<em>子会话怎么「挂」到父会话上,让两边都知道彼此?</em>答案优雅得只用了事件溯源本身:
+</p>
+<pre><code>// 同一条 link 事件,写进父、也写进子
+store.AppendEvent(parent.SessionID, {Type: EventSessionChild, Payload: payload})  // lineage.go:50
+store.AppendEvent(child.SessionID,  {Type: EventSessionChild, Payload: payload})  // lineage.go:53</code></pre>
+<div class="callout">
+<span class="label">为什么写两遍 —— 双向书签,而不是一张关系表</span>
+既然会话就是一条追加日志(第七课),那「把子挂到父上」就<em>不需要</em>另建一张关系数据库表:
+只要把<strong>同一条链接事件</strong>追加到<em>两条</em>日志里就行 —— 父的日志里出现「我生了个子(childSessionId=…)」,子的日志里出现「我爸是谁(parentSessionId=…)」。
+于是 resume 父会话时,TUI 顺着读父日志,一见 <code>EventSessionChild</code> 就渲染出一张 specialist 卡片;而子会话独立打开时,也知道自己的出身。
+<strong>链接是数据,不是 schema。</strong>payload 里还带 <code>rootSessionId</code>/<code>spawnedFromSequence</code>
+<a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:204</a>,把整棵树串起来。
+</div>
+
+<h2>拓扑:向上是链,向下是树</h2>
+<p>
+有了 <code>ParentSessionID</code> 和 <code>RootSessionID</code>
+<a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:38</a>,导航是两个方向:
+</p>
+<ul>
+<li><strong>向上:<code>Lineage</code></strong> <a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:99</a> 顺 <code>ParentSessionID</code> 一路走到根,还带环检测(<code>seen</code> map),防止损坏的元数据把遍历卡死。</li>
+<li><strong>向下:<code>Tree</code></strong> <a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:127</a> 建整棵子会话树。这里有个性能修正值得一看:旧实现每个节点都调一次 <code>ListChildren</code>,而每次 <code>ListChildren</code> 又全盘扫一遍磁盘上所有会话元数据 —— O(节点数 × 总会话数)。新实现<strong>一次扫描</strong>把所有会话按 parent 建索引,再在内存里递归<a class="cite" href="../../zero/internal/sessions/lineage.go">lineage.go:144</a>。</li>
+</ul>
+
+<div class="callout warn">
+<span class="label">两者共用第七课的地基</span>
+Fork 和 Child 都只是在 <code>store.Create</code> + 事件日志之上<em>各加一点动作</em>:Fork <em>回放</em>父事件 + 拷 blob;Child <em>追加</em>一条双向链接事件。
+没有第二套存储模型 —— 会话的「繁殖」完全长在第七课那条追加日志上。这就是事件溯源的复利:一个原语(append event)同时支撑了持久化、<code>/rewind</code>、fork、和子会话挂载。
+</div>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">Fork 与 Child 在「父会话历史」上的根本区别是什么?</p>
+  <button class="opt">两者都整段复制父历史,区别只在于新会话的种类标记不同</button>
+  <button class="opt">Fork 整段复制父历史后分岔,Child 不复制而带自己 prompt 起</button>
+  <button class="opt">两者都不复制父历史,都靠父会话的引用指针按需懒加载读取</button>
+  <button class="opt">Fork 只复制最后一个事件,Child 复制除用量以外的全部事件</button>
+  <div class="fb"
+    data-correct="对 —— Fork 逐条回放父事件拿到完整历史副本再续(store.go:430);Child 不抄历史,作为 specialist 带自己 prompt 从头干(lineage.go:9)。"
+    data-wrong="Fork=复制父历史后分岔(store.go:430);Child=不复制,子会话带自己 prompt 从空起(lineage.go:9)。这是两者的结构分水岭。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">Fork 复制父会话事件时,为什么唯独跳过 usage 用量事件?</p>
+  <button class="opt">因为用量事件的数据结构在新会话里已经完全无法被正确解析</button>
+  <button class="opt">因为用量事件体积过大复制它会显著拖慢整个分叉过程的速度</button>
+  <button class="opt">用量已计在父会话头上,再带一份会让聚合报告重复计费</button>
+  <button class="opt">因为分叉出来的新会话必须从零重新开始统计它自己的用量</button>
+  <div class="fb"
+    data-correct="对 —— token 用量已算在父头上;fork 也带一份则聚合报告重复计费。fork 只需对话历史能续,用量不重放(store.go:435)——第十/十二课非幂等纪律的会话层回响。"
+    data-wrong="用量已计在父会话上,fork 再带一份会重复计费;fork 只要历史能续,用量不复制(store.go:435)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">子会话是怎么「挂」到父会话上、让两边都知道彼此的?</p>
+  <button class="opt">同一条链接事件被追加进父与子两条日志,形成双向书签</button>
+  <button class="opt">在一张独立的关系数据库表里插入一条父子对应的映射记录</button>
+  <button class="opt">父会话在内存里持有一个指向所有活跃子会话对象的指针数组</button>
+  <button class="opt">子会话把父会话的全部事件复制过来以此隐式建立起从属关系</button>
+  <div class="fb"
+    data-correct="对 —— 会话即追加日志,故挂载=把同一条 EventSessionChild 写进父(childSessionId)与子(parentSessionId)两条日志;链接是数据不是 schema(lineage.go:50/:53)。"
+    data-wrong="把同一条 EventSessionChild 事件追加进父、子两条日志:父端记 childSessionId、子端记 parentSessionId,双向书签,无需关系表(lineage.go:50)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +390 ../zero/internal/sessions/store.go     # Fork:回放父事件 + 跳过 usage + 拷 blob + EventSessionFork
+less +435 ../zero/internal/sessions/store.go     # 为什么不复制 usage:避免重复计费
+less +9   ../zero/internal/sessions/lineage.go   # CreateChild:子会话 + 双写链接事件
+less +204 ../zero/internal/sessions/lineage.go   # childLinkPayload:parent/child/root + spawnedFrom
+less +127 ../zero/internal/sessions/lineage.go   # Tree:一次扫描建索引(O(n) vs 旧的 O(节点×总数))</code></pre>
+<p>
+读的顺序:先把 <code>Fork</code> 的循环看完 —— 注意它 <em>copy</em> 事件、跳过 usage、拷 blob。再读 <code>CreateChild</code> 那两行几乎一样的
+<code>AppendEvent</code>(一条进父、一条进子)—— 这一处「同一事件写两遍」就是「子会话挂到父上」的全部机制。
+最后看 <code>Tree</code> 的单次扫描注释,体会「事件溯源里,关系也是事件,不是表」。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「specialist 子会话跑起来后,进度(工具数/token)怎么<em>实时</em>回流到父会话的那张卡片(<code>specialist_start</code>/<code>specialist_stop</code> 事件 + TUI <code>specialistTracker</code>)?」、
+「<code>exec_session.go</code> 里 <code>ModeFork</code> 是怎么从 CLI 一路接到 <code>store.Fork</code> 的?」,
+或者换个大块:「压缩恢复的触发判定 —— <code>compactor.recover</code> 怎么认出上下文超限、又怎么保证只压一次?」</div>
+
+<div class="nav">
+  <span>← 第十四课:沙箱 runner 包裹</span>
+  <span>会话的「繁殖」两条路径已覆盖。下一步可选:specialist 进度回流 / 压缩恢复触发判定 / 风险分类</span>
+</div>
+
+<footer>Zero 架构课程 · 第十五课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第七课 — 会话持久化与时间旅行:事件日志 + 内容寻址快照</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第七课</p>
+<h1>会话持久化与 /rewind:把「磁带」落盘,再倒带</h1>
+
+<p>
+第一课讲过循环里那条只追加的 <code>messages</code> 磁带 —— 但它活在内存里,进程一退就没了。
+这一课讲 Zero 怎么把它<strong>落盘</strong>(于是有了 <code>/resume</code>),又怎么让它能<strong>倒带</strong>
+到任意历史点、连同<em>工作区文件</em>一起回滚(于是有了 <code>/rewind</code>)。
+两个特性,一个底座:<strong>事件溯源(event sourcing)</strong>。
+</p>
+
+<blockquote>
+对齐 mission:一个真实的 coding agent 会改用户的文件。既然会改,就得能<em>撤销</em> ——
+不只是撤销对话,还要撤销磁盘上的副作用。这一课是「agent 如何对自己的破坏负责」。
+</blockquote>
+
+<h2>核心洞察一:会话就是一条只追加的事件日志</h2>
+<p>
+一次会话的真身是磁盘上的 <code>events.jsonl</code>(<code>EventsFile</code>,
+<a class="cite" href="../../zero/internal/sessions/store.go">store.go:21</a>)—— 每行一个 JSON 事件,
+只追加、永不改写。每个事件形状统一:
+<a class="cite" href="../../zero/internal/sessions/store.go">store.go:168</a>
+</p>
+<pre><code>type Event struct {
+    ID        string          // 全局 id
+    SessionID string
+    Sequence  int             // ← 单调递增,排序的唯一真相
+    Type      EventType       // message / tool_call / tool_result / session_checkpoint / …
+    CreatedAt string
+    Payload   json.RawMessage // 按 Type 解释的载荷
+}</code></pre>
+<p>
+事件类型是一个开放枚举:用户消息、工具调用、工具结果、权限决定、用量、压缩标记、
+<strong>checkpoint</strong>、<strong>rewind</strong> 标记……
+<a class="cite" href="../../zero/internal/sessions/store.go">store.go:27</a>
+这正是第一课那条内存磁带的持久化版本:<strong>状态 = 对事件日志的一次 fold</strong>。
+<code>/resume</code> 不过是「读回 <code>events.jsonl</code>、重放成对话」。
+</p>
+<div class="callout">
+<span class="label">谁是真相</span>
+注释点明:<strong>事件日志才是排序的唯一真相</strong>,元数据里的 <code>EventCount</code> 只是缓存
+(<a class="cite" href="../../zero/internal/sessions/store.go">store.go:584</a>)。崩溃恢复时,以日志实际内容为准 ——
+这是事件溯源系统的铁律:派生状态可以重算,日志不可篡改。
+</div>
+
+<h2>核心洞察二:改文件之前,先拍一张「之前」</h2>
+<p>
+第二课讲过每个改文件的工具都走 <code>executeToolCall</code> 的关卡。这里补上一环:在<em>真正动手改</em>
+之前,先给要改的文件拍一张 before 快照 —— <code>CaptureToolCheckpoint</code>
+<a class="cite" href="../../zero/internal/sessions/checkpoint.go">checkpoint.go:63</a>。
+它做两件事:
+</p>
+<ol>
+<li>把每个目标文件的<strong>当前内容</strong>存成一个 blob,文件名就是内容的 <code>sha256</code> —— 即
+<strong>内容寻址(content-addressed)</strong>。
+<a class="cite" href="../../zero/internal/sessions/checkpoint.go">checkpoint.go:55</a></li>
+<li>追加一条 <code>EventSessionCheckpoint</code> 事件,里面索引这些 blob(哪个路径 → 哪个 hash)。
+<a class="cite" href="../../zero/internal/sessions/checkpoint.go">checkpoint.go:31</a></li>
+</ol>
+<p>
+每个 <code>CheckpointFile</code> 还记了两个特殊位:<code>Absent</code>(文件<em>之前不存在</em> → 回滚时应
+<strong>删除</strong>它)、<code>Skipped</code>(超过 5 MiB 上限,没存 → 回滚时无法恢复,如实标记而非假装成功)。
+<a class="cite" href="../../zero/internal/sessions/checkpoint.go">checkpoint.go:20</a>
+capture 是<strong>尽力而为</strong>的:读不了的文件记为 skipped,绝不因此让工具调用失败。
+</p>
+<div class="callout">
+<span class="label">内容寻址的两个红利</span>
+① <strong>天然去重</strong>:同样的内容存两次 = 同一个 blob,磁盘不翻倍。② 但也带来一个
+<em>孤儿窗口</em>:一个 blob 在「写完」到「被某个事件引用」之间,是<strong>可被回收误删</strong>的。
+所以 capture 全程<strong>持一把会话锁</strong>,把「写 blob」和「追加引用它的事件」<em>圈在一起</em>,
+不给并发的 <code>pruneOrphanBlobs</code> 留缝
+(<a class="cite" href="../../zero/internal/sessions/checkpoint.go">checkpoint.go:70</a>)。
+</div>
+
+<h2>倒带:不存「目标态」,而是从「之后发生的事」反推</h2>
+<p>
+<code>/rewind</code> 到 <code>targetSeq</code> 的精妙之处:它<strong>并不需要</strong>保存过目标点的完整快照。
+它靠<em>目标点之后每一次改动的 before 快照</em>反推出目标态 ——
+<code>RestoreToSequence</code>
+<a class="cite" href="../../zero/internal/sessions/rewind.go">rewind.go:29</a>:
+</p>
+<pre><code>取出 targetSeq 之后的所有 checkpoint,
+按「离目标最近的先处理」遍历,
+每个路径只认第一次见到的(=最接近目标的)那张 before 快照,
+更新的快照全部忽略。</code></pre>
+<p>
+道理:一个文件在目标点之后可能被改了 5 次,产生 5 张 before 快照。离目标最近那一次的 before,
+<em>正是目标点时刻的内容</em>。所以「按最接近目标优先、每路径短路取第一张」就还原出了目标态。
+<a class="cite" href="../../zero/internal/sessions/rewind.go">rewind.go:55</a>
+</p>
+<p>
+<code>ApplyRewind</code> 把整个倒带做成<strong>一把锁下的四步原子操作</strong>
+<a class="cite" href="../../zero/internal/sessions/rewind.go">rewind.go:235</a>:
+</p>
+<table style="border-collapse:collapse;width:100%;font-size:0.9rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">步</th><th style="text-align:left;padding:.4rem .6rem;font-size:.75rem;text-transform:uppercase;color:var(--muted)">动作</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">①</td><td style="padding:.4rem .6rem">还原工作区文件到目标态(应用 before 快照,原子写:临时文件 + rename)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">②</td><td style="padding:.4rem .6rem">截断事件日志,只留 <code>Sequence ≤ targetSeq</code>(原子重写 jsonl)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .6rem">③</td><td style="padding:.4rem .6rem">回收现在没人引用的孤儿 blob(<code>pruneOrphanBlobs</code>)</td></tr>
+<tr><td style="padding:.4rem .6rem">④</td><td style="padding:.4rem .6rem">追加一条 <code>EventSessionRewind</code> 标记(倒带本身也是一个事件)</td></tr>
+</table>
+<p>
+四步<strong>只锁一次</strong>,用的都是 <code>*Locked</code> 内部变体,防止并发写在子步骤间插进来
+(也因此不能重复加这把不可重入的锁,否则自死锁)。
+<a class="cite" href="../../zero/internal/sessions/rewind.go">rewind.go:239</a>
+注意第 ④ 步:连「倒带」这件事本身都被记成一个事件 —— 日志永远只追加,连回滚也不例外。
+</p>
+
+<div class="callout warn">
+<span class="label">安全:临改前再确认边界</span>
+每次写/删之前,<code>resolveWithinWorkspace</code> 会<em>紧贴着 mutation</em>重新解析并确认路径落在
+工作区内 —— 纵深防御:即便某个 checkpoint 事件被篡改(<code>../</code> 路径穿越)或工作区内有指向
+外部的符号链接,也绝不越界写删。代码坦诚地标注了残留的 symlink-swap TOCTOU 窗口及其低风险前提。
+<a class="cite" href="../../zero/internal/sessions/rewind.go">rewind.go:80</a>
+损坏的 checkpoint 载荷是<strong>硬错误</strong>而非跳过 —— 跳过会让更新的快照错误地胜出,还原出比
+用户要求更晚的状态。
+</p>
+</div>
+
+<h2>回接第六课</h2>
+<p>
+还记得 <code>cancelRun</code> 里那个 <code>flushRunIDs</code> 吗(<code>model.go:4042</code>)?现在它有意义了:
+一次被取消的 run,它在每次改文件前拍的 checkpoint blob 已经落盘;把它的 <code>runID</code> 记下来、
+保证其最终事件仍被排干写入,<code>/rewind</code> 才引用得到那些 blob,而不至于让它们变成磁盘上的
+孤儿。<strong>取消的善后、持久化的完整、倒带的可用,是同一根链条。</strong>
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="1">
+  <p class="q">一次 Zero 会话在磁盘上的「真相之源」是什么?</p>
+  <button class="opt">一个记录最终状态的快照文件</button>
+  <button class="opt">只追加的事件日志 events.jsonl,状态是对它的 fold</button>
+  <button class="opt">元数据里的 EventCount 计数器</button>
+  <button class="opt">工作区文件的当前内容</button>
+  <div class="fb"
+    data-correct="对 —— events.jsonl 只追加、按 Sequence 排序,是唯一真相;EventCount 只是缓存(store.go:21 / :584)。"
+    data-wrong="是 events.jsonl:只追加的事件日志,状态由它重放得出;EventCount 只是派生缓存(store.go:584)。"></div>
+</div>
+
+<div class="quiz" data-answer="2">
+  <p class="q">checkpoint 的 blob 用什么当文件名,带来什么红利?</p>
+  <button class="opt">用时间戳,便于按时间排序</button>
+  <button class="opt">用随机 UUID,避免碰撞</button>
+  <button class="opt">用内容的 sha256(内容寻址),相同内容自动去重</button>
+  <button class="opt">用文件的原路径,便于定位</button>
+  <div class="fb"
+    data-correct="对 —— 内容寻址:blob 名=内容 sha256,同内容只存一份;代价是需锁住写blob+引用事件防孤儿(checkpoint.go:55/:70)。"
+    data-wrong="用内容的 sha256(内容寻址),相同内容天然去重;孤儿窗口靠会话锁圈住写与引用来防(checkpoint.go:55)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">倒带到 targetSeq 时,某文件的目标态是怎么还原的?</p>
+  <button class="opt">应用目标之后各次改动的 before 快照,离目标最近的那张胜出</button>
+  <button class="opt">读取一份专门在目标点保存的完整快照</button>
+  <button class="opt">从最初的空文件重放所有 after 快照</button>
+  <button class="opt">向 provider 请求重新生成该文件</button>
+  <div class="fb"
+    data-correct="对 —— 离目标最近那次改动的 before 就是目标态;按最近优先、每路径短路取第一张(rewind.go:29/:55)。"
+    data-wrong="不存目标态,而是用『目标之后每次改动的 before 快照』反推,最接近目标的那张 before 胜出(rewind.go:55)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +168 ../zero/internal/sessions/store.go       # Event 结构 + 事件类型枚举(:27)
+less +574 ../zero/internal/sessions/store.go       # appendEventLocked:日志是排序真相
+less +63  ../zero/internal/sessions/checkpoint.go  # CaptureToolCheckpoint:拍 before 快照
+less +29  ../zero/internal/sessions/rewind.go      # RestoreToSequence:最近优先反推
+less +235 ../zero/internal/sessions/rewind.go      # ApplyRewind:一把锁下的四步原子倒带</code></pre>
+<p>
+读的顺序:先认 <code>Event</code> 那六个字段和一长串 <code>EventType</code> —— 会话的一切都是这些事件的序列。
+再看 <code>CaptureToolCheckpoint</code> 怎么「存 blob + 追加索引事件」。最后重点读 <code>ApplyRewind</code>
+那四步,以及 <code>RestoreToSequence</code> 里「closest-to-target wins」的短路循环 —— 整套时间旅行的
+智慧就在这两处。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>replay.go</code> 怎么把事件日志重放成 <code>messages</code> 磁带的(<code>/resume</code> 的另一半)?」、
+「会话锁是进程内 mutex + 文件锁(<code>filelock_unix.go</code>)两层,分别防什么?」,
+或者「<code>EventSessionFork</code> / <code>EventSessionChild</code> 是干嘛的 —— 会话怎么分叉、specialist 子会话怎么挂上来?」
+</div>
+
+<div class="nav">
+  <span>← 第六课:TUI 桥接</span>
+  <span>已覆盖:循环五要素 + 人机界面 + 持久化。下一步可选:Provider 适配层 / 沙箱引擎 / 会话重放(replay)</span>
+</div>
+
+<footer>Zero 架构课程 · 第七课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第二十课 — Skill vs 用户命令:同是 markdown,一个「模型按需取」,一个「人敲了就展开」</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第二十课</p>
+<h1>两种可复用指令,喂进循环的<em>两端</em>:模型拉取 vs 人类宏展开</h1>
+
+<p>
+第十九课的 <code>skill</code> 和这一课的<strong>用户 slash 命令</strong>(<code>usercommands</code>
+<a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:17</a>)长得几乎一样:都是磁盘上带 frontmatter 的 markdown 文件。
+新手极易把它俩当同一个东西。但它们在 agent 循环里进入的<strong>位置</strong>相反——一个是<em>模型</em>在回合中途主动拉取,一个是<em>人</em>敲完命令、在到达模型<em>之前</em>就被展开成普通 prompt。看懂这个「谁发起、在哪一层」的分野,就看懂了 agent 的两种扩展入口。
+</p>
+
+<blockquote>
+对齐 mission:一个 coding agent 要让用户注入可复用指令,有两个截然不同的需求。① 模型自己判断「这活儿该照某套规矩来」——那规矩得让<em>模型</em>能按需取(skill)。
+② 用户想把一段冗长的常用请求存成快捷方式,敲 <code>/release v1.2</code> 就展开——那是<em>人</em>发起的宏,模型根本不需要知道有个命令(user command)。同一份 markdown 文件基底,喂进循环的两端。
+</blockquote>
+
+<h2>一句话对照</h2>
+<table style="border-collapse:collapse;width:100%;font-size:0.85rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)"></th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">skill(第十九课)</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">用户命令</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">谁发起</td><td style="padding:.3rem .5rem"><strong>模型</strong>(工具调用)</td><td style="padding:.3rem .5rem"><strong>人</strong>(敲 <code>/name</code>)</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">在哪层解析</td><td style="padding:.3rem .5rem">回合中途,注册表分发</td><td style="padding:.3rem .5rem"><strong>到模型之前</strong>,TUI 里</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">进入形态</td><td style="padding:.3rem .5rem">工具 <code>Output</code>(消息流里)</td><td style="padding:.3rem .5rem">一条普通用户 prompt</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">模型知情否</td><td style="padding:.3rem .5rem">知道:是它自己调的</td><td style="padding:.3rem .5rem"><strong>不知道</strong>:只见展开后的文本</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">正文处理</td><td style="padding:.3rem .5rem">原样返回</td><td style="padding:.3rem .5rem"><code>$ARGUMENTS</code>/<code>$1..$9</code> 模板展开</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.3rem .5rem">作用域</td><td style="padding:.3rem .5rem">仅用户级</td><td style="padding:.3rem .5rem">项目级 <em>覆盖</em> 用户级</td></tr>
+<tr><td style="padding:.3rem .5rem">额外 frontmatter</td><td style="padding:.3rem .5rem">name/description</td><td style="padding:.3rem .5rem">还带 <code>model</code>/<code>agent</code> 路由</td></tr>
+</table>
+
+<h2>用户命令:一个「到模型之前」就完成的宏展开</h2>
+<p>
+用户敲的 <code>/release v1.2</code> 若不是内建命令,就落到 <code>handleUserCommand</code>
+<a class="cite" href="../../zero/internal/tui/user_commands.go">user_commands.go:20</a>。它做三件事,全在 <strong>TUI 客户端</strong>完成:
+</p>
+<pre><code>name, args := splitUserCommand(raw)                 // "/release v1.2" → name, "v1.2"
+cmd, ok := m.lookupUserCommand(name)                // 查文件命令表        user_commands.go:25
+prompt := usercommands.Expand(cmd.Template, args)   // 模板展开成文本      :29
+next, teaCmd := m.launchPrompt(prompt)              // 当作普通 prompt 发起 :33</code></pre>
+<p>
+关键在最后一步:展开后的文本走 <code>launchPrompt</code>,和用户<em>手打</em>一段话<strong>完全一样</strong>。模型收到的只是一段 prompt,
+<em>它根本不知道背后有个 <code>/release</code> 命令</em>。所以用户命令本质是<strong>客户端的文本宏</strong>——像 shell 的 alias,在请求出门前就替换掉了,循环、模型、注册表都无需为它增加任何概念。
+</p>
+<div class="callout">
+<span class="label">模板展开:<code>$ARGUMENTS</code> / <code>$1..$9</code> / <code>$$</code></span>
+<code>Expand</code> <a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:146</a>
+把 <code>$ARGUMENTS</code> 换成整串参数、<code>$1..$9</code> 换成第 N 个空格分隔位置参数、<code>$$</code> 换成字面 <code>$</code>。
+一个巧妙的兜底:<em>模板里若一个 <code>$</code> 占位符都没有</em>,就把原始参数<strong>另起一行追加</strong>到模板后
+(<a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:150</a>)——这样连最简单的「命令 + 用户补充」也能work,不必强迫作者写占位符。
+</div>
+
+<h2>作用域:用户命令有「项目级覆盖」,skill 没有</h2>
+<p>
+用户命令扫两个目录:项目的 <code>.zero/commands/</code> 和用户的 <code>&lt;config&gt;/zero/commands/</code>
+(<code>DefaultPaths</code> <a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:45</a>)。
+<code>Load</code> <a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:60</a> <strong>先装用户、再装项目</strong>,同名时项目条目<em>覆盖</em>用户条目——
+于是一个 repo 能把团队工作流<em>签进版本库</em>,且盖过个人的同名命令(与 specialist 的 scope 优先级同规矩)。
+</p>
+<p>
+这与第十九课 skill 的<em>用户级唯一 + 字典序去重</em>是有意的分野:skill 是「模型能力」,当前不做项目级;用户命令天生是「团队可共享的工作流」,所以要项目 &gt; 用户的覆盖语义。<strong>不同的发起者,决定了不同的作用域设计。</strong>
+</p>
+
+<div class="callout warn">
+<span class="label">防串味:文件名必须是安全的命令形状</span>
+<code>validCommandName</code> <a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:107</a>
+只认小写字母/数字/连字符——这样一个乱起名的文件<em>无法</em>靠奇怪字符去<strong>影子覆盖一个内建命令</strong>。
+注意查找顺序:内建命令先匹配,不中才落到 <code>handleUserCommand</code>(<a class="cite" href="../../zero/internal/tui/user_commands.go">user_commands.go:11</a>)——用户命令<em>补充</em>内建,而非篡夺。
+</p>
+</div>
+
+<h2>额外一手:用户命令能<em>换模型/换 agent</em></h2>
+<p>
+用户命令的 frontmatter 除了 <code>description</code>,还认 <code>model</code> 和 <code>agent</code>/<code>mode</code>
+(<code>parseCommand</code> <a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:119</a>)——因为它是「发起一整个回合」的入口,自然可以指定这回合用哪个模型、路由到哪个 specialist。
+skill 没有这种字段,因为它只是把一段文字塞进<em>当前</em>回合,无权改变回合本身的参数。<strong>能携带什么元数据,由它在循环里的角色决定。</strong>
+</p>
+
+<h2>合起来看:同一份文件基底,喂进循环的两端</h2>
+<p>
+skill 和用户命令共享几乎相同的「目录 + frontmatter + markdown」实现(连 <code>splitFrontmatter</code> 都是彼此的镜像,
+<a class="cite" href="../../zero/internal/usercommands/usercommands.go">usercommands.go:185</a>),但它们服务于相反的发起者:
+<strong>skill 是模型伸手去<em>取</em>的能力</strong>(工具,回合中途,模型知情),<strong>用户命令是人敲下就<em>展开</em>的宏</strong>(客户端文本替换,到模型前完成,模型无感)。
+判断某个新需求该做成哪一个,只问一句话:<em>「这该由模型决定用不用,还是由人决定发不发?」</em>
+</p>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">用户敲的 <code>/release v1.2</code> 命令,是在 agent 循环的<em>哪一层</em>被处理的?</p>
+  <button class="opt">交由模型在回合中途以一次工具调用的形式主动加载并执行它</button>
+  <button class="opt">先发给模型让它识别出这是命令,再由模型决定要不要展开模板</button>
+  <button class="opt">在 TUI 客户端就展开成普通 prompt,到达模型之前命令已消失</button>
+  <button class="opt">由服务端在收到请求后统一拦截并替换成对应的那段模板文本</button>
+  <div class="fb"
+    data-correct="对 —— handleUserCommand 在 TUI 里 splitUserCommand→lookup→Expand→launchPrompt,展开后当普通 prompt 发起;模型只见文本,不知道背后有 /release(user_commands.go:20/:29)。它是客户端文本宏,像 shell alias。"
+    data-wrong="用户命令在 TUI 客户端展开(Expand)成普通 prompt 再 launchPrompt,到模型前命令已替换掉;模型无感(user_commands.go:29)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">skill 和用户命令在「谁发起」上的根本区别是什么?</p>
+  <button class="opt">skill 由模型按需取用,用户命令由人敲下后在客户端展开发起</button>
+  <button class="opt">skill 由人在设置里勾选启用,用户命令由模型自动匹配后调用</button>
+  <button class="opt">两者都由模型发起,区别仅在于各自读取的磁盘目录位置不同</button>
+  <button class="opt">两者都由人手动发起,区别仅在于是否携带模型路由的字段值</button>
+  <div class="fb"
+    data-correct="对 —— skill 是模型伸手去取的能力(工具,回合中途,模型知情);用户命令是人敲下就展开的宏(客户端文本替换,到模型前完成,模型无感)。发起者相反(usercommands.go:17)。"
+    data-wrong="skill=模型按需拉取的工具;用户命令=人敲 /name、客户端展开成 prompt 的宏。喂进循环的两端,发起者相反(user_commands.go:20)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">为什么用户命令有「项目级覆盖用户级」,而 skill 只有用户级?</p>
+  <button class="opt">因为项目目录扫描更快,故优先用它来缩短命令的解析耗时</button>
+  <button class="opt">用户命令天生是团队可签进版本库的工作流,故需项目覆盖语义</button>
+  <button class="opt">因为 skill 文件体积通常更大,放进项目目录会拖慢仓库克隆</button>
+  <button class="opt">因为项目级的 skill 会带来跨成员的安全风险所以被刻意禁用掉</button>
+  <div class="fb"
+    data-correct="对 —— Load 先装用户再装项目,同名时项目覆盖(usercommands.go:60);因为用户命令是团队可 checkin 的工作流,要 repo 盖过个人。skill 是模型能力,当前不做项目级。不同发起者→不同作用域(usercommands.go:45)。"
+    data-wrong="用户命令是团队共享工作流,需项目 > 用户覆盖(Load 先用户后项目,usercommands.go:60);skill 是模型能力、只用户级。作用域设计跟着发起者走。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +20  ../zero/internal/tui/user_commands.go        # handleUserCommand:split→lookup→Expand→launchPrompt
+less +146 ../zero/internal/usercommands/usercommands.go # Expand:$ARGUMENTS/$1..$9/$$ + 无占位符兜底
+less +60  ../zero/internal/usercommands/usercommands.go # Load:先用户后项目,项目覆盖同名
+less +107 ../zero/internal/usercommands/usercommands.go # validCommandName:防影子覆盖内建命令
+less +119 ../zero/internal/usercommands/usercommands.go # parseCommand:model/agent 路由 frontmatter</code></pre>
+<p>
+读的顺序:先看 <code>handleUserCommand</code> 那四行——<code>Expand</code> 完就 <code>launchPrompt</code>,是理解「命令在到模型前就变回普通 prompt」的关键。
+再看 <code>Expand</code> 的占位符替换和「无 <code>$</code> 就追加参数」的兜底。最后对照第十九课的 <code>skill.go</code>:同样的 frontmatter 解析,却服务于相反的发起者。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「用户命令 frontmatter 里的 <code>agent</code>/<code>mode</code> 是怎么把这一回合<em>路由到某个 specialist</em> 的?」、
+「MCP server 也能通过 prompts/list 提供<em>curated prompt</em>(<a class="cite" href="../../zero/internal/mcp/prompts.go">prompts.go:57</a>)——它和用户命令这种本地宏又差在哪?」,
+或者换个大块:「swarm/多 agent 编排的骨架——多个 agent 怎么被拉起、分工、汇合?」</div>
+
+<div class="nav">
+  <span>← 第十九课:Skill 系统</span>
+  <span>「模型拉取 vs 人类宏展开」两种扩展入口已辨清。下一步可选:agent/mode 回合路由 / MCP curated prompt / swarm 编排骨架</span>
+</div>
+
+<footer>Zero 架构课程 · 第二十课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

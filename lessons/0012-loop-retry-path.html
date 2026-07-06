@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第十二课 — loop.go 的重试路径:什么时候敢把一整轮再发一遍</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<p class="eyebrow">Zero 架构 · 第十二课</p>
+<h1>循环层的重试:三道防线,一条判据</h1>
+
+<p>
+第十课讲了 <code>providerio</code> 在 <strong>HTTP 层</strong>重试(429/503,只重「服务器没接活」的失败)。但那只覆盖
+「发一个 POST、收首个响应头」。如果流<em>已经连上</em>、吐了一点字、然后<strong>卡死</strong>了呢?或者流到一半撞上
+<strong>上下文超限</strong>呢?这些 HTTP 层管不着 —— 得由 <code>loop.go</code> 在<strong>一整轮</strong>的粒度上恢复。
+这一课拆开循环里包着一次 turn 的三道恢复防线。
+</p>
+
+<blockquote>
+对齐 mission:一个跑长任务(大重构、swarm 成员、headless/cron)的 agent,不该因为一次网络抖动或一次模型卡顿
+就整轮暴毙、把已烧的 token 全部重烧。但「重发一整轮」是危险的 —— 弄不好会把用户已经读到的答案<em>重复</em>一遍。
+这一课的全部功夫,就在回答一个问题:<strong>什么时候重发是安全的?</strong>
+</blockquote>
+
+<h2>贯穿三道防线的判据:这一轮<em>提交</em>过答案文本吗?</h2>
+<p>
+延续第十课那条「非幂等 → 不可盲目重放」的铁律,循环层的版本是:<strong>只有当这一轮还没向用户吐出任何
+最终答案散文(prose),才敢把整轮再发一遍。</strong>已经吐了字再重发,用户就会看到重复的答案。
+这个判据由一个布尔量看守 —— <code>forwardedVisibleText</code>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:223</a>:
+</p>
+<pre><code>forwardedVisibleText := false
+if options.OnText != nil {
+    forwardingOpts.OnText = func(s string) { forwardedVisibleText = true; options.OnText(s) }
+}</code></pre>
+<div class="callout">
+<span class="label">为什么只认 OnText,不认 reasoning / 工具预览</span>
+关键的不对称:<code>OnText</code>(最终散文)一响就置位;但 <code>OnReasoning</code>、<code>OnToolCallDelta</code>
+(「正在写 write_file…」的临时预览)<strong>不</strong>置位
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:228</a>。
+因为临时输出重发是安全的:TUI 在下一个 tool-call-start 会重置预览,而一个卡死的 turn <em>从不会</em>被
+append 进 <code>messages</code>(它在 append 之前就带着 <code>collected.Error</code> 返回了)。所以只有真正的
+答案散文,才是「重发会可见重复」的那种输出。这直接建立在第十一课的回调之上 —— <code>OnText</code> 就是那里来的。
+</div>
+
+<h2>防线一:连接级重连(还没吐字就断了)</h2>
+<p>
+<code>streamWithReconnect</code>
+<a class="cite" href="../../zero/internal/agent/reconnect.go">reconnect.go:64</a>
+只重试<strong>连接本身</strong>:<code>StreamCompletion</code> 在<em>任何内容被转发之前</em>就以「断连状」失败,就退避重连,
+最多 2 次(<code>maxStreamReconnects</code>,base 500ms 指数退避)。因为一个字都还没吐,重连绝不会重复任何 <code>OnText</code>。
+</p>
+<p>
+它只对「断连状」的错误出手 —— <code>shouldReconnect</code>
+<a class="cite" href="../../zero/internal/agent/reconnect.go">reconnect.go:91</a> 的白名单:<code>eof</code> /
+<code>connection reset</code> / <code>timeout</code> / <code>502</code> / <code>503</code> / <code>broken pipe</code>…;并<strong>明确排除</strong>
+ctx 取消(调用方在关停)、上下文超限(压缩器管)、图片拒绝(有专门话术)
+<a class="cite" href="../../zero/internal/agent/reconnect.go">reconnect.go:96</a> —— 不去和别的处理器抢活。
+</p>
+
+<h2>防线二:内容卡死重试(连上了、吐了临时输出、然后沉默)</h2>
+<p>
+这是最精妙的一道。第十课的双看门狗会把「一直心跳却不产出」的流判成 <code>ErrStreamStalled</code>/<code>ErrStreamIdle</code>;
+这些错误经 <code>collected.Error</code> 冒到循环里,由 <code>isStreamTimeoutError</code>
+<a class="cite" href="../../zero/internal/agent/compaction.go">compaction.go:289</a> 认出。循环据此重发<strong>整个请求</strong>,
+最多 2 次(<code>maxStreamStallRetries</code>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:28</a>)—— 但只在判据成立时:
+</p>
+<pre><code>for attempt := 1; attempt &lt;= maxStreamStallRetries &&
+    isStreamTimeoutError(collected.Error) && !forwardedVisibleText &&
+    collected.Text == ""; attempt++ {          // ← loop.go:305 三重闸门
+    ...
+    retryStream, _ := streamWithReconnect(ctx, provider, retryRequest, ...)
+    collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, forwardingOpts)
+}</code></pre>
+<div class="callout">
+<span class="label">「丢弃并重试」——半截 tool call 的处理</span>
+覆盖两种卡死
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:289</a>:①什么都没流出来就断了(macOS 陈旧连接挂死);
+②流了点 reasoning、开了个 tool call(比如大的 <code>write_file</code>)然后<em>卡在参数中间</em>(gpt-5.x/ollama 常见)。
+第②种的半截 tool call <strong>永不执行</strong>(带 error 的 turn 在 dispatch 之前就返回)、<strong>永不进 messages</strong> ——
+所以重试是拿<em>干净的上下文</em>重发,唯一的重渲染只是临时预览。<em>这就是为什么闸门里不排除 <code>collected.ToolCalls</code>:
+超时流里的半截 tool call 是「丢弃并重试」,而不是输出。</em>
+</div>
+<p>
+反过来:一个<em>已经吐了真散文</em>的 turn 即便随后卡死,也<strong>不</strong>重试(会重复可见答案)—— 直接落到下面的错误返回。
+每次重试前经 <code>stallRetryNoticeFor</code> 通过 <code>OnReasoning</code>(非内容通道)告诉用户「模型卡住,重试中」,
+措辞刻意区别于防线一的「连接断了」—— 连接明明是好的,是模型卡了。
+</p>
+
+<h2>防线三:反应式压缩(流到一半撞上上下文超限)</h2>
+<p>
+<code>recoverStreamError</code>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:243</a> 处理 <code>collected.Error</code> 里的<em>非卡死</em>错误:
+</p>
+<ul>
+<li><strong>图片拒绝</strong>→ 包装成友好提示(建议换 vision 模型),硬停
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:244</a>。</li>
+<li><strong>上下文超限</strong>(有的 provider 流到一半才报)→ 调 <code>compactor.recover</code> <strong>压缩一次 + 重发一次</strong>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:249</a>;重发时故意<em>省掉可见回调</em>(错误前的输出已经转发过了)。</li>
+</ul>
+<p>
+巧妙之处:这个恢复器<strong>对初始流和被重发的流一视同仁</strong> —— 防线二重发出来的流若又报了个非卡死错误,
+同样路由回 <code>recoverStreamError</code>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:331</a>,而不是把原始错误抛出去。
+(还有一条<em>先发制人</em>的压缩:在流开始<em>之前</em>就预判超限并压缩,loop.go:186 —— 与这条反应式的互补。)
+</p>
+
+<div class="callout warn">
+<span class="label">顺序也是正确性</span>
+恢复逻辑里 <strong><code>ctx.Err()</code> 必须先查</strong>
+<a class="cite" href="../../zero/internal/agent/loop.go">loop.go:285</a>:取消时 <code>helpers.go</code>(第十一课)会把
+<code>collected.Error</code> 设成 <code>ctx.Err().Error()</code>,若此时直接 <code>errors.New(collected.Error)</code>,就<em>丢掉了</em>
+被包装的 sentinel,<code>errors.Is(err, context.Canceled)</code> 就失效了。所以先认取消、再认业务错误 ——
+一个把「取消」误判成「上游错误」的 bug,就藏在这个先后顺序里。
+</div>
+
+<h2>三道防线一张表</h2>
+<table style="border-collapse:collapse;width:100%;font-size:0.88rem;margin:1rem 0">
+<tr style="border-bottom:1px solid var(--rule)"><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">防线</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">治什么</th><th style="text-align:left;padding:.4rem .5rem;font-size:.72rem;text-transform:uppercase;color:var(--muted)">重发什么/几次</th></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .5rem">① 重连</td><td style="padding:.4rem .5rem">连接时断连(未吐字)</td><td style="padding:.4rem .5rem">只重连,×2</td></tr>
+<tr style="border-bottom:1px solid var(--rule)"><td style="padding:.4rem .5rem">② 卡死重试</td><td style="padding:.4rem .5rem">连上后沉默/只心跳</td><td style="padding:.4rem .5rem">整轮,×2,须未吐散文</td></tr>
+<tr><td style="padding:.4rem .5rem">③ 反应式压缩</td><td style="padding:.4rem .5rem">流中报上下文超限</td><td style="padding:.4rem .5rem">压缩后整轮,×1</td></tr>
+</table>
+
+<h2>动手回忆</h2>
+
+<div class="quiz" data-answer="2">
+  <p class="q">循环敢把一整轮请求重发,靠的是哪个判据?</p>
+  <button class="opt">距离上次成功的请求已经过去了足够长的退避时间</button>
+  <button class="opt">本轮收集到的 tool call 数量仍然为零且没有报错</button>
+  <button class="opt">本轮尚未转发任何最终答案散文(forwardedVisibleText 为假)</button>
+  <button class="opt">当前所处的 provider 明确声明支持幂等的重放语义</button>
+  <div class="fb"
+    data-correct="对 —— 只认 OnText 触发的可见散文;reasoning/工具预览不算,卡死轮从不进 messages,故重发拿干净上下文(loop.go:223)。"
+    data-wrong="判据是 forwardedVisibleText:只有没吐过最终散文才敢重发,否则会重复用户已读的答案(loop.go:223)。"></div>
+</div>
+
+<div class="quiz" data-answer="0">
+  <p class="q">流卡在半截 <code>write_file</code> 的参数里,那个半截 tool call 怎么办?</p>
+  <button class="opt">丢弃并重试:它从不执行也从不进 messages,重发拿干净上下文</button>
+  <button class="opt">先保存已收到的参数片段,重连后从断点继续拼接完整</button>
+  <button class="opt">照常派发执行,由工具层自己去处理不完整的参数输入</button>
+  <button class="opt">立即终止整个运行,并向用户报告一个不可恢复的错误</button>
+  <div class="fb"
+    data-correct="对 —— 带 error 的 turn 在 dispatch 前就返回、不 append messages;半截 call 是丢弃并重试,故闸门不排除 ToolCalls(loop.go:289)。"
+    data-wrong="半截 call 从不执行、从不进 messages,是『丢弃并重试』;重发拿干净上下文,只重渲染临时预览(loop.go:289)。"></div>
+</div>
+
+<div class="quiz" data-answer="1">
+  <p class="q">恢复逻辑里为什么必须先查 <code>ctx.Err()</code> 再看 <code>collected.Error</code>?</p>
+  <button class="opt">因为查 ctx 的开销远小于构造并比较错误字符串的开销</button>
+  <button class="opt">取消时 Error 被设为 ctx.Err 文本,先包装会丢掉 sentinel</button>
+  <button class="opt">因为 provider 要求取消信号必须优先于业务错误上报</button>
+  <button class="opt">为了让退避计时器能够在取消发生时被及时地停止掉</button>
+  <div class="fb"
+    data-correct="对 —— 取消时 helpers 把 collected.Error 设成 ctx.Err().Error();直接 errors.New 会丢 sentinel,破坏 errors.Is(context.Canceled)(loop.go:285)。"
+    data-wrong="取消时 collected.Error=ctx.Err() 文本;不先查 ctx 就 errors.New 会丢掉被包装的 sentinel,errors.Is 失效(loop.go:285)。"></div>
+</div>
+
+<h2>接下来该读的一手源码</h2>
+<pre><code>less +64  ../zero/internal/agent/reconnect.go  # streamWithReconnect:连接级重连(防线一)
+less +91  ../zero/internal/agent/reconnect.go  # shouldReconnect:断连白名单 + 三类排除
+less +223 ../zero/internal/agent/loop.go       # forwardedVisibleText:重发安全的判据
+less +305 ../zero/internal/agent/loop.go       # 卡死重试 for 循环(防线二)+ 三重闸门
+less +243 ../zero/internal/agent/loop.go       # recoverStreamError:图片拒绝 + 反应式压缩(防线三)</code></pre>
+<p>
+读的顺序:先看 <code>forwardedVisibleText</code> 那个只被 <code>OnText</code> 置位的闭包 —— 整章的判据就在这一行。
+再对读三道防线:<code>streamWithReconnect</code>(只重连)、卡死 for 循环(重整轮、闸门 <code>!forwardedVisibleText && Text==""</code>)、
+<code>recoverStreamError</code>(压缩后重发)。最后体会 loop.go:289 那段长注释 —— 它把「为什么半截 tool call 可以丢弃重试」
+讲得比任何教材都清楚。
+</p>
+
+<div class="ask">
+<strong>我是你的老师 —— 随时问我。</strong> 适合现在追问:
+「<code>compactor.recover</code>(第三课的压缩)怎么判断一个错误是上下文超限、又怎么只压一次?」、
+「沙箱引擎怎么在 <code>executeToolCall</code>(第二课)里真正隔离命令执行?」,
+或者「会话怎么 <code>/fork</code>、specialist 子会话(<code>EventSessionChild</code>)怎么挂到父会话上?」
+</div>
+
+<div class="nav">
+  <span>← 第十一课:CollectStream 抽流</span>
+  <span>循环的错误恢复层已补全。下一步可选:沙箱引擎 / 会话分叉与子会话 / 压缩恢复的触发判定</span>
+</div>
+
+<footer>Zero 架构课程 · 第十二课 · 基于 <code>github.com/Gitlawb/zero</code> 源码</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>
